@@ -43,10 +43,19 @@ groups:
           summary: "Dead-lettered outbox events on {{ $labels.service }}"
           description: "{{ $value }} event(s) will never be delivered without operator action."
 
+      # Expressed with `unless` rather than `and`. Two problems made the
+      # earlier `rate(...) == 0 and favl_outbox_pending > 0` unable to fire:
+      # the operands carry different label sets (publish_total has subject and
+      # result, pending has only service) so they never matched, and when a
+      # publisher has never succeeded the rate() series does not exist at all,
+      # so `== 0` selects nothing. `unless` is empty-safe in exactly that
+      # case — a backlog with no successful publishes is what we want to page
+      # on, and that is precisely when the right-hand side is absent.
       - alert: OutboxStalledWhileWriting
         expr: |
-          rate(favl_outbox_publish_total{result="success"}[5m]) == 0
-            and favl_outbox_pending > 0
+          sum by (service) (favl_outbox_pending) > 0
+            unless
+          sum by (service) (rate(favl_outbox_publish_total{result="success"}[5m])) > 0
         for: 5m
         labels:
           severity: critical

@@ -17,12 +17,14 @@ import hmac
 import json
 import logging
 import os
-from datetime import datetime, timezone
+from dataclasses import replace
+from datetime import UTC, datetime
 from typing import Any
 
 import httpx
 
 from ..security import outbound
+from ..security.policy import build_policy, rejected_operator_keys
 from ..security.secrets import SecretNotFound, SecretResolver, is_secret_reference
 from ..security.ssrf import OutboundPolicy, SSRFBlocked
 from .base import (
@@ -68,22 +70,9 @@ class WebhookAdapter:
         self._secrets = secret_resolver
 
     def _policy(self, config: dict[str, Any]) -> OutboundPolicy:
-        return OutboundPolicy(
-            allowed_hosts=frozenset(config.get("allowed_hosts") or []),
-            allowed_schemes=tuple(config.get("allowed_schemes", ("https",))),
-            allow_private_addresses=bool(config.get("allow_private_addresses", False)),
-            # A notification endpoint that redirects is misconfigured.
-            max_redirects=0,
-            max_response_bytes=int(
-                config.get("max_response_bytes", DEFAULT_MAX_RESPONSE_BYTES)
-            ),
-            allowed_content_types=tuple(
-                config.get(
-                    "allowed_content_types",
-                    ("application/json", "text/plain", "application/problem+json"),
-                )
-            ),
-        )
+        # A notification endpoint that redirects is misconfigured, so the
+        # redirect budget is fixed at zero regardless of configuration.
+        return replace(build_policy(config), max_redirects=0)
 
     async def validate_config(self, config: dict[str, Any]) -> ValidationResult:
         errors: list[str] = []
@@ -94,7 +83,9 @@ class WebhookAdapter:
 
         secret_ref = config.get("signing_secret_ref")
         if not secret_ref:
-            errors.append("config.signing_secret_ref is required; deliveries are signed")
+            errors.append(
+                "config.signing_secret_ref is required; deliveries are signed"
+            )
         elif not is_secret_reference(secret_ref):
             errors.append(
                 "config.signing_secret_ref must be a reference such as "
@@ -103,6 +94,10 @@ class WebhookAdapter:
 
         if config.get("signing_secret"):
             errors.append("config.signing_secret is not permitted; use a reference")
+
+        escalating = rejected_operator_keys(config)
+        if escalating:
+            errors.append(f"config may not set operator-controlled keys: {escalating}")
 
         if errors:
             return ValidationResult.failed(*errors)
@@ -116,7 +111,7 @@ class WebhookAdapter:
 
     async def health_check(self, context: ConnectorContext) -> HealthResult:
         """Resolvability and policy only — no unsolicited delivery is sent."""
-        started = datetime.now(timezone.utc)
+        started = datetime.now(UTC)
         url = context.config.get("target_url")
         if not url:
             return HealthResult(False, "no target_url configured", started)
@@ -132,19 +127,21 @@ class WebhookAdapter:
         except SecretNotFound as exc:
             return HealthResult(False, f"secret unresolved: {exc.reference}", started)
 
-        return HealthResult(True, "target reachable by policy; secret resolvable", started)
+        return HealthResult(
+            True, "target reachable by policy; secret resolvable", started
+        )
 
     async def invoke(
         self, request: InvocationRequest, context: ConnectorContext
     ) -> InvocationResult:
-        started = datetime.now(timezone.utc)
+        started = datetime.now(UTC)
         remaining = request.seconds_remaining(started)
         if remaining <= 0:
             return InvocationResult.failure(
                 ErrorCode.DEADLINE_EXCEEDED,
                 "deadline passed before dispatch",
                 started_at=started,
-                completed_at=datetime.now(timezone.utc),
+                completed_at=datetime.now(UTC),
             )
 
         try:
@@ -154,7 +151,7 @@ class WebhookAdapter:
                 ErrorCode.SECRET_NOT_FOUND,
                 getattr(exc, "reference", "signing_secret_ref"),
                 started_at=started,
-                completed_at=datetime.now(timezone.utc),
+                completed_at=datetime.now(UTC),
             )
 
         timestamp = str(int(started.timestamp()))
@@ -198,31 +195,31 @@ class WebhookAdapter:
                 ErrorCode.UPSTREAM_TIMEOUT,
                 "webhook delivery timed out",
                 started_at=started,
-                completed_at=datetime.now(timezone.utc),
+                completed_at=datetime.now(UTC),
             )
         except outbound.ResponseTooLarge as exc:
             return InvocationResult.failure(
                 ErrorCode.RESPONSE_TOO_LARGE,
                 str(exc),
                 started_at=started,
-                completed_at=datetime.now(timezone.utc),
+                completed_at=datetime.now(UTC),
             )
         except SSRFBlocked as exc:
             return InvocationResult.failure(
                 ErrorCode.SSRF_BLOCKED,
                 exc.reason,
                 started_at=started,
-                completed_at=datetime.now(timezone.utc),
+                completed_at=datetime.now(UTC),
             )
         except httpx.HTTPError as exc:
             return InvocationResult.failure(
                 ErrorCode.UPSTREAM_UNAVAILABLE,
                 f"{type(exc).__name__}"[:200],
                 started_at=started,
-                completed_at=datetime.now(timezone.utc),
+                completed_at=datetime.now(UTC),
             )
 
-        completed = datetime.now(timezone.utc)
+        completed = datetime.now(UTC)
         # The delivery record proves what was sent without retaining the body
         # or the signing secret.
         audit = {

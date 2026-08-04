@@ -16,10 +16,11 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "services" / "connector-registry"))
 
 from app.security.ssrf import (  # noqa: E402
-    METADATA_ADDRESSES,
+    METADATA_NETWORKS,
     OutboundPolicy,
     SSRFBlocked,
     _address_is_forbidden,
+    normalise_address,
     validate_url,
 )
 
@@ -217,7 +218,81 @@ def test_dns_failure_is_blocked_not_ignored():
 
 
 def test_every_known_metadata_address_is_covered():
-    for address in METADATA_ADDRESSES:
-        assert _address_is_forbidden(ipaddress.ip_address(address)) == (
+    for network in METADATA_NETWORKS:
+        assert _address_is_forbidden(network.network_address) == (
             "cloud_metadata_endpoint"
         )
+
+
+# ------------------------------------------------------------------ #
+# embedded-IPv4 normalisation
+# ------------------------------------------------------------------ #
+#
+# `::ffff:169.254.169.254` reaches the same host as `169.254.169.254`, but on
+# Python 3.11 — the version these services actually run — its is_link_local
+# is False. Classifying the unwrapped form keeps the guard independent of the
+# interpreter, and these cases pin that.
+
+
+@pytest.mark.parametrize(
+    "wrapped,expected",
+    [
+        ("::ffff:169.254.169.254", "cloud_metadata_endpoint"),
+        ("::ffff:100.100.100.200", "cloud_metadata_endpoint"),
+        ("::ffff:127.0.0.1", "loopback_address"),
+        ("::ffff:169.254.1.1", "link_local_address"),
+        ("::ffff:10.0.0.1", "private_address"),
+        ("::ffff:192.168.1.1", "private_address"),
+        ("::ffff:100.64.0.1", "shared_address_space"),
+        ("64:ff9b::169.254.169.254", "cloud_metadata_endpoint"),
+        ("64:ff9b::127.0.0.1", "loopback_address"),
+        ("2002:7f00:1::", "loopback_address"),
+        ("2002:a00:1::", "private_address"),
+    ],
+)
+def test_embedded_ipv4_forms_are_unwrapped_before_classification(wrapped, expected):
+    assert _address_is_forbidden(ipaddress.ip_address(wrapped)) == expected
+
+
+@pytest.mark.parametrize(
+    "wrapped,expected",
+    [
+        ("::ffff:169.254.169.254", "cloud_metadata_endpoint"),
+        ("::ffff:127.0.0.1", "loopback_address"),
+        ("64:ff9b::169.254.169.254", "cloud_metadata_endpoint"),
+    ],
+)
+def test_embedded_forms_stay_blocked_when_private_is_allowed(wrapped, expected):
+    policy = OutboundPolicy(
+        allowed_hosts=frozenset({"svc.internal"}),
+        allowed_schemes=("http", "https"),
+        allow_private_addresses=True,
+    )
+    with _resolving_to(wrapped), pytest.raises(SSRFBlocked) as exc:
+        validate_url("http://svc.internal/x", policy)
+    assert exc.value.reason == expected
+
+
+def test_normalisation_leaves_a_plain_ipv6_address_alone():
+    ip = ipaddress.ip_address("2606:4700::1111")
+    assert normalise_address(ip) == ip
+    assert _address_is_forbidden(ip) is None
+
+
+def test_pinned_address_is_the_normalised_form():
+    """The socket must go where the check was made, not to the wrapper."""
+    policy = OutboundPolicy(allowed_hosts=frozenset({"api.example.com"}))
+    with _resolving_to("::ffff:93.184.216.34"):
+        target = validate_url("https://api.example.com/x", policy)
+    assert target.address == "93.184.216.34"
+
+
+def test_literal_ip_in_url_is_classified_without_dns():
+    """A URL naming an address directly never reaches getaddrinfo."""
+    policy = OutboundPolicy(
+        allowed_hosts=frozenset({"169.254.169.254"}),
+        allowed_schemes=("http", "https"),
+    )
+    with pytest.raises(SSRFBlocked) as exc:
+        validate_url("http://169.254.169.254/latest/meta-data/", policy)
+    assert exc.value.reason == "cloud_metadata_endpoint"

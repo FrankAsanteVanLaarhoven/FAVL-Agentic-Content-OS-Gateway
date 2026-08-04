@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import logging
 import os
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 
 import httpx
@@ -54,9 +54,11 @@ class InternalAdapter:
         self._registry = registry if registry is not None else _load_registry()
 
     def _policy(self, host: str) -> OutboundPolicy:
-        # Internal destinations are private by definition, so private
-        # addresses are permitted — but only for a registered service, and
-        # metadata endpoints stay blocked inside resolve_and_validate.
+        # Private addressing is permitted here because the destination set
+        # is INTERNAL_SERVICE_REGISTRY, which only an operator can change —
+        # unlike the http/webhook adapters, no part of this comes from a
+        # connector record. Loopback, link-local and metadata remain blocked
+        # inside resolve_and_validate regardless.
         return OutboundPolicy(
             allowed_hosts=frozenset({host}),
             allowed_schemes=("http", "https"),
@@ -94,7 +96,7 @@ class InternalAdapter:
         return base, context.config.get("operation", "")
 
     async def health_check(self, context: ConnectorContext) -> HealthResult:
-        started = datetime.now(timezone.utc)
+        started = datetime.now(UTC)
         try:
             base, _ = self._target(context)
         except SSRFBlocked as exc:
@@ -115,7 +117,7 @@ class InternalAdapter:
         except Exception as exc:
             return HealthResult(False, f"{type(exc).__name__}: {exc}"[:200], started)
 
-        latency = (datetime.now(timezone.utc) - started).total_seconds() * 1000
+        latency = (datetime.now(UTC) - started).total_seconds() * 1000
         return HealthResult(
             healthy=200 <= response.status_code < 300,
             detail=f"HTTP {response.status_code}",
@@ -126,7 +128,7 @@ class InternalAdapter:
     async def invoke(
         self, request: InvocationRequest, context: ConnectorContext
     ) -> InvocationResult:
-        started = datetime.now(timezone.utc)
+        started = datetime.now(UTC)
         try:
             base, operation = self._target(context)
         except SSRFBlocked as exc:
@@ -134,7 +136,7 @@ class InternalAdapter:
                 ErrorCode.SERVICE_NOT_REGISTERED,
                 exc.detail,
                 started_at=started,
-                completed_at=datetime.now(timezone.utc),
+                completed_at=datetime.now(UTC),
             )
 
         remaining = request.seconds_remaining(started)
@@ -143,7 +145,7 @@ class InternalAdapter:
                 ErrorCode.DEADLINE_EXCEEDED,
                 "deadline passed before dispatch",
                 started_at=started,
-                completed_at=datetime.now(timezone.utc),
+                completed_at=datetime.now(UTC),
             )
 
         url = f"{base}/{operation.lstrip('/')}"
@@ -169,31 +171,31 @@ class InternalAdapter:
                 ErrorCode.UPSTREAM_TIMEOUT,
                 str(exc),
                 started_at=started,
-                completed_at=datetime.now(timezone.utc),
+                completed_at=datetime.now(UTC),
             )
         except outbound.ResponseTooLarge as exc:
             return InvocationResult.failure(
                 ErrorCode.RESPONSE_TOO_LARGE,
                 str(exc),
                 started_at=started,
-                completed_at=datetime.now(timezone.utc),
+                completed_at=datetime.now(UTC),
             )
         except SSRFBlocked as exc:
             return InvocationResult.failure(
                 ErrorCode.SSRF_BLOCKED,
                 exc.reason,
                 started_at=started,
-                completed_at=datetime.now(timezone.utc),
+                completed_at=datetime.now(UTC),
             )
         except httpx.HTTPError as exc:
             return InvocationResult.failure(
                 ErrorCode.UPSTREAM_UNAVAILABLE,
                 f"{type(exc).__name__}: {exc}",
                 started_at=started,
-                completed_at=datetime.now(timezone.utc),
+                completed_at=datetime.now(UTC),
             )
 
-        completed = datetime.now(timezone.utc)
+        completed = datetime.now(UTC)
         return _classify(response, started, completed, service_hint=operation)
 
 

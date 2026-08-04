@@ -2,23 +2,27 @@ from __future__ import annotations
 
 import logging
 import os
+import secrets
 import uuid
+from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Request, Response, status
 from fastapi.responses import JSONResponse
-from favl_outbox import enqueue
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 from sqlalchemy import select, text
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from favl_outbox import enqueue
+
 from . import invocations as inv
 from .adapters.base import ConnectorContext, InvocationStatus
 from .adapters.registry import UnknownAdapterKind, build_registry, registry_snapshot
 from .db import SessionLocal, engine, get_session
+from .identity import CallerIdentity, current_identity, current_tenant
 from .models import ConnectorRecord, ConnectorStatus, InvocationRecord
 from .outbox import (
     WINDOW_UTILISATION,
@@ -35,18 +39,45 @@ from .schemas import (
     InvocationCreate,
     ValidationReport,
 )
+from .security.redaction import redact_config
 
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 logger = logging.getLogger(__name__)
 
-__all__ = ["app", "Connector", "ConnectorCreate"]
+__all__ = ["Connector", "ConnectorCreate", "app"]
 
 ADAPTERS = build_registry()
-EXPECTED_MIGRATION = os.getenv("EXPECTED_MIGRATION", "0004")
+EXPECTED_MIGRATION = os.getenv("EXPECTED_MIGRATION", "0005")
+
+# /internal/* bypasses APISIX, so it carries no OIDC token. It is protected
+# by a shared service credential compared in constant time, in addition to
+# any NetworkPolicy: network position alone is not authentication, and a
+# compromised in-cluster workload would otherwise inherit full connector
+# invocation rights.
+INTERNAL_SERVICE_TOKEN = os.getenv("INTERNAL_SERVICE_TOKEN", "")
+
+
+def require_internal_caller(
+    x_internal_service_token: str = Header(default=""),
+) -> None:
+    if not INTERNAL_SERVICE_TOKEN:
+        # Unset means the internal surface is disabled rather than open.
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "error_code": "INTERNAL_SURFACE_DISABLED",
+                "message": "INTERNAL_SERVICE_TOKEN is not configured",
+            },
+        )
+    if not secrets.compare_digest(x_internal_service_token, INTERNAL_SERVICE_TOKEN):
+        raise HTTPException(
+            status_code=401,
+            detail={"error_code": "INTERNAL_AUTH_FAILED"},
+        )
 
 
 @asynccontextmanager
-async def lifespan(app: FastAPI):
+async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     logger.info("outbox.duplicate_window_utilisation=%.1f%%", WINDOW_UTILISATION * 100)
     logger.info("adapters.registered %s", registry_snapshot(ADAPTERS))
     await connection.connect()
@@ -68,19 +99,48 @@ app = FastAPI(
 
 
 def _to_schema(record: ConnectorRecord) -> Connector:
-    return Connector(
-        id=str(record.id),
-        name=record.name,
-        kind=record.kind,
-        base_url=record.base_url,
-        scopes=list(record.scopes),
-        config=dict(record.config or {}),
-        status=record.status,
-        version=record.version,
-        created_at=record.created_at,
-        deletion_requested_at=record.deletion_requested_at,
-        deleted_at=record.deleted_at,
+    # model_validate rather than the constructor: `kind` and `status` are
+    # plain columns constrained by CHECK constraints, and `base_url` is text.
+    # Pydantic owns narrowing those to their literal and URL types; asserting
+    # the narrow types here would be a claim the ORM cannot back.
+    return Connector.model_validate(
+        {
+            "id": str(record.id),
+            "name": record.name,
+            "kind": record.kind,
+            "base_url": record.base_url,
+            "scopes": list(record.scopes),
+            # Redacted on every read path: a credential that slipped past
+            # validation must not be republished through the API or
+            # into an outbox event.
+            "config": redact_config(dict(record.config or {})),
+            "status": record.status,
+            "version": record.version,
+            "created_at": record.created_at,
+            "deletion_requested_at": record.deletion_requested_at,
+            "deleted_at": record.deleted_at,
+        }
     )
+
+
+def _http_status_for(record: InvocationRecord) -> int:
+    """HTTP status for a terminal invocation state.
+
+    Shared by the fresh and replay branches. When these diverged, replaying
+    a failed idempotency key returned 200 while the original attempt had
+    returned 502 — a caller retrying after a failure would have concluded it
+    had succeeded.
+    """
+    if record.status == InvocationStatus.SUCCEEDED.value:
+        return 200
+    if record.status == InvocationStatus.TIMED_OUT.value:
+        return 504
+    if record.status in (
+        InvocationStatus.ACCEPTED.value,
+        InvocationStatus.RUNNING.value,
+    ):
+        return 202
+    return 502
 
 
 def _invocation_schema(record: InvocationRecord) -> Invocation:
@@ -129,9 +189,34 @@ async def live() -> dict[str, str]:
     return {"status": "live"}
 
 
-@app.get("/readyz")
 @app.get("/health/ready")
+async def public_ready() -> Response:
+    """Reduced public readiness.
+
+    Booleans only. The detailed body — dependency exception strings, outbox
+    counters, registered adapters — is reconnaissance material for an
+    unauthenticated caller, and /health/* is the one unauthenticated route on
+    the gateway. Operators read /readyz, which is cluster-internal.
+    """
+    detail = await _readiness()
+    return JSONResponse(
+        {
+            "status": detail["status"],
+            "database_connected": detail["database_connected"],
+            "nats_connected": detail["nats_connected"],
+            "migrations_current": detail["migrations_current"],
+        },
+        status_code=200 if detail["status"] == "ready" else 503,
+    )
+
+
+@app.get("/readyz")
 async def ready() -> Response:
+    detail = await _readiness()
+    return JSONResponse(detail, status_code=200 if detail["status"] == "ready" else 503)
+
+
+async def _readiness() -> dict[str, Any]:
     db_ok = True
     migrations_current = False
     outbox: dict[str, Any] = {}
@@ -174,8 +259,7 @@ async def ready() -> Response:
         body["nats_last_error"] = connection.last_error
     if publisher.last_error:
         body["outbox_last_error"] = publisher.last_error
-    # Non-200 when unready: orchestrators routinely inspect only the code.
-    return JSONResponse(body, status_code=200 if healthy else 503)
+    return body
 
 
 @app.get("/metrics")
@@ -320,7 +404,7 @@ async def connector_health(
 async def request_connector_deletion(
     connector_id: uuid.UUID,
     session: AsyncSession = Depends(get_session),
-    x_actor_id: str = Header(default="unknown"),
+    caller: CallerIdentity = Depends(current_identity),
 ) -> Response:
     """Soft deletion.
 
@@ -343,8 +427,8 @@ async def request_connector_deletion(
         return Response(status_code=status.HTTP_204_NO_CONTENT)
 
     record.status = ConnectorStatus.DELETION_REQUESTED.value
-    record.deletion_requested_at = datetime.now(timezone.utc)
-    record.deleted_by = x_actor_id
+    record.deletion_requested_at = datetime.now(UTC)
+    record.deleted_by = caller.actor_id
     record.version += 1
 
     enqueue(
@@ -355,7 +439,7 @@ async def request_connector_deletion(
             "connector_id": str(connector_id),
             "name": record.name,
             "status": record.status,
-            "requested_by": x_actor_id,
+            "requested_by": caller.actor_id,
             "requested_at": record.deletion_requested_at.isoformat(),
         },
         aggregate_type="connector",
@@ -377,8 +461,7 @@ async def invoke_connector_v1(
     payload: InvocationCreate,
     request: Request,
     session: AsyncSession = Depends(get_session),
-    x_actor_id: str = Header(default="anonymous"),
-    x_tenant_id: str = Header(default="default"),
+    caller: CallerIdentity = Depends(current_identity),
 ) -> Response:
     record = await session.get(ConnectorRecord, connector_id)
     if record is None:
@@ -399,45 +482,72 @@ async def invoke_connector_v1(
         record,
         operation=payload.operation,
         idempotency_key=payload.idempotency_key,
-        actor_id=x_actor_id,
-        tenant_id=x_tenant_id,
+        actor_id=caller.actor_id,
+        tenant_id=caller.tenant_id,
         timeout_seconds=payload.timeout_seconds,
         trace_id=trace_id,
     )
 
     if replay is not None:
-        if replay.in_flight:
-            # Still running: hand back the existing id rather than starting a
-            # second provider-side effect.
-            return JSONResponse(
-                _invocation_schema(invocation).model_dump(mode="json"),
-                status_code=202,
-            )
-        # Terminal: return the stored result verbatim, success or failure.
+        # Terminal replays carry the original attempt's status; in-flight
+        # replays return 202 with the existing id rather than starting a
+        # second provider-side effect.
         return JSONResponse(
-            _invocation_schema(invocation).model_dump(mode="json"), status_code=200
+            _invocation_schema(invocation).model_dump(mode="json"),
+            status_code=_http_status_for(invocation),
         )
 
     invocation = await inv.execute(
         session, ADAPTERS, record, invocation, payload.payload
     )
-    if invocation.status == InvocationStatus.SUCCEEDED.value:
-        http_status = 200
-    elif invocation.status == InvocationStatus.TIMED_OUT.value:
-        http_status = 504
-    else:
-        http_status = 502
     return JSONResponse(
-        _invocation_schema(invocation).model_dump(mode="json"), status_code=http_status
+        _invocation_schema(invocation).model_dump(mode="json"),
+        status_code=_http_status_for(invocation),
     )
+
+
+@app.get("/v1/invocations", response_model=list[Invocation])
+async def list_invocations(
+    connector_id: uuid.UUID | None = None,
+    status_filter: str | None = None,
+    limit: int = 50,
+    before: datetime | None = None,
+    session: AsyncSession = Depends(get_session),
+    tenant_id: str = Depends(current_tenant),
+) -> list[Invocation]:
+    """Newest first, keyset-paged on created_at.
+
+    Offset paging would drift as new invocations arrive during a scroll,
+    which is the normal case for an operational console.
+    """
+    # Always tenant-scoped. An invocation record carries actor, operation and
+    # provider identifiers, so cross-tenant reads are a disclosure bug.
+    query = (
+        select(InvocationRecord)
+        .where(InvocationRecord.tenant_id == tenant_id)
+        .order_by(InvocationRecord.created_at.desc())
+    )
+    if connector_id is not None:
+        query = query.where(InvocationRecord.connector_id == connector_id)
+    if status_filter:
+        query = query.where(InvocationRecord.status == status_filter)
+    if before is not None:
+        query = query.where(InvocationRecord.created_at < before)
+    query = query.limit(max(1, min(limit, 200)))
+    result = await session.execute(query)
+    return [_invocation_schema(record) for record in result.scalars()]
 
 
 @app.get("/v1/invocations/{invocation_id}", response_model=Invocation)
 async def get_invocation(
-    invocation_id: uuid.UUID, session: AsyncSession = Depends(get_session)
+    invocation_id: uuid.UUID,
+    session: AsyncSession = Depends(get_session),
+    tenant_id: str = Depends(current_tenant),
 ) -> Invocation:
     record = await session.get(InvocationRecord, invocation_id)
-    if record is None:
+    # 404 rather than 403 on a tenant mismatch: confirming that an id exists
+    # in another tenant is itself a disclosure.
+    if record is None or record.tenant_id != tenant_id:
         raise HTTPException(status_code=404, detail="Invocation not found")
     return _invocation_schema(record)
 
@@ -447,6 +557,7 @@ async def invoke_connector_internal(
     connector_id: uuid.UUID,
     payload: dict[str, Any],
     session: AsyncSession = Depends(get_session),
+    _: None = Depends(require_internal_caller),
 ) -> dict[str, Any]:
     """Orchestrator-facing path. Same runtime, no echo fallback."""
     record = await session.get(ConnectorRecord, connector_id)

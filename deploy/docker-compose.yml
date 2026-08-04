@@ -1,6 +1,9 @@
+# Images are pinned by digest, not tag. A tag is mutable, so a stack that
+# passed CI is not necessarily the stack that runs; a digest makes them the
+# same bytes. Refresh with: scripts/update_image_digests.sh
 services:
   apisix:
-    image: apache/apisix:3.17.0-debian
+    image: apache/apisix:3.17.0-debian@sha256:6cbf65f3085d1386bfd636b7e88400c163c3641841909e674af7896a5766b092
     restart: unless-stopped
     volumes:
       - ../gateway/config.yaml:/usr/local/apisix/conf/config.yaml:ro
@@ -28,6 +31,7 @@ services:
       CONNECTOR_REGISTRY_URL: ${CONNECTOR_REGISTRY_URL}
       OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT}
       DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/favl_orchestrator
+      INTERNAL_SERVICE_TOKEN: ${INTERNAL_SERVICE_TOKEN}
       OUTBOX_PUBLISHER_ENABLED: ${OUTBOX_PUBLISHER_ENABLED:-true}
     depends_on:
       nats:
@@ -52,16 +56,47 @@ services:
       # Development signing key for the webhook adapter. M1.7 replaces the
       # env-backed resolver with a real secret manager.
       WEBHOOK_SIGNING_KEY: ${WEBHOOK_SIGNING_KEY:-dev-signing-key}
+      INTERNAL_SERVICE_TOKEN: ${INTERNAL_SERVICE_TOKEN}
+      ALLOW_ANONYMOUS_IDENTITY: ${ALLOW_ANONYMOUS_IDENTITY:-false}
     depends_on:
       nats:
         condition: service_started
       postgres:
         condition: service_healthy
 
+  console:
+    build:
+      context: ..
+      dockerfile: apps/console/Dockerfile
+    restart: unless-stopped
+    environment:
+      # The console holds the token server-side and calls the platform
+      # through APISIX, so it exercises the same authenticated path an
+      # external client would rather than reaching services directly.
+      GATEWAY_URL: http://apisix:9080
+      KEYCLOAK_TOKEN_URL: ${KEYCLOAK_TOKEN_URL}
+      KEYCLOAK_CLIENT_ID: ${KEYCLOAK_CLIENT_ID}
+      KEYCLOAK_CLIENT_SECRET: ${KEYCLOAK_CLIENT_SECRET}
+      CONSOLE_USERNAME: ${CONSOLE_USERNAME}
+      CONSOLE_PASSWORD: ${CONSOLE_PASSWORD}
+      # Readiness is read directly: /health/* is unauthenticated, and if
+      # identity is down the status bar must still report the data plane.
+      ORCHESTRATOR_URL: http://orchestrator:8000
+      REGISTRY_URL: http://connector-registry:8001
+      PROMETHEUS_URL: http://prometheus:9090
+    depends_on:
+      - apisix
+      - keycloak
+    ports:
+      # Loopback only: the console holds a gateway credential server-side and
+      # must not be reachable from the LAN. 3000 is taken by another local
+      # project on this host.
+      - "127.0.0.1:3100:3000"
+
   # Development only: never started unless the `dev` profile is requested.
   testprovider:
     profiles: ["dev"]
-    image: python:3.11-slim
+    image: python:3.11-slim@sha256:f9fa7f851e38bfb19c9de3afbc4b86ae7176ea7aaf94535c31df5458d5849457
     restart: unless-stopped
     command: ["python", "/app/provider.py"]
     environment:
@@ -71,7 +106,7 @@ services:
       - ./testprovider/provider.py:/app/provider.py:ro
 
   postgres:
-    image: postgres:17-alpine
+    image: postgres:17-alpine@sha256:742f40ea20b9ff2ff31db5458d127452988a2164df9e17441e191f3b72252193
     restart: unless-stopped
     environment:
       POSTGRES_USER: ${POSTGRES_USER}
@@ -93,7 +128,7 @@ services:
       - "127.0.0.1:5435:5432"
 
   nats:
-    image: nats:2.11-alpine
+    image: nats:2.11-alpine@sha256:e4bf19f15fd3218814a4e3c9e0064e1334bd8aa20d5984b9f1a0afd084f8cc00
     command: ["-js", "-m", "8222", "--store_dir", "/data"]
     restart: unless-stopped
     volumes:
@@ -103,7 +138,7 @@ services:
       - "8222:8222"
 
   nats-exporter:
-    image: natsio/prometheus-nats-exporter:latest
+    image: natsio/prometheus-nats-exporter:0.20.1@sha256:4fbf6dacb84780a45a1c3af9b1080c69451a288d20902deae671b80717bb8f61
     restart: unless-stopped
     command:
       - "-varz"
@@ -118,7 +153,7 @@ services:
       - "7777:7777"
 
   keycloak:
-    image: quay.io/keycloak/keycloak:26.3
+    image: quay.io/keycloak/keycloak:26.3@sha256:357829ec7c4693397533035092ad13b0644bcc95ded311f33a3738c4d9e9bdba
     command: ["start-dev", "--import-realm"]
     restart: unless-stopped
     environment:
@@ -130,7 +165,7 @@ services:
       - "8080:8080"
 
   otel-collector:
-    image: otel/opentelemetry-collector-contrib:0.131.1
+    image: otel/opentelemetry-collector-contrib:0.131.1@sha256:c06aa6d7833e9a2b81c6c394d67e40ae9864edec8dca8a8e8552df1316c96d9b
     command: ["--config=/etc/otelcol-contrib/config.yaml"]
     volumes:
       - ./otel-collector.yaml:/etc/otelcol-contrib/config.yaml:ro
@@ -139,7 +174,7 @@ services:
       - "4318:4318"
 
   prometheus:
-    image: prom/prometheus:v3.5.0
+    image: prom/prometheus:v3.5.0@sha256:63805ebb8d2b3920190daf1cb14a60871b16fd38bed42b857a3182bc621f4996
     volumes:
       - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
       - ./prometheus-alerts.yml:/etc/prometheus/alerts.yml:ro

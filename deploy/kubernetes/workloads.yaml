@@ -1,0 +1,256 @@
+# Workloads for the data plane.
+#
+# The probe split is the load-bearing part of this file. Liveness checks only
+# that the process is running its event loop; readiness checks PostgreSQL,
+# NATS and schema currency. Pointing liveness at a dependency check would turn
+# a database outage into a cluster-wide restart storm — every replica failing
+# liveness simultaneously, restarting, and failing again — which converts a
+# degraded service into no service at all.
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: agentic-content-os
+  labels:
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/audit: restricted
+    pod-security.kubernetes.io/warn: restricted
+---
+# Migrations run once per release, not once per replica. Running them from
+# every pod's entrypoint (as the development compose stack does) races the
+# Alembic version lock and can deadlock a rollout.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: orchestrator-migrate
+  namespace: agentic-content-os
+  annotations:
+    # Must complete before the Deployment is applied.
+    argocd.argoproj.io/hook: PreSync
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+spec:
+  backoffLimit: 3
+  ttlSecondsAfterFinished: 3600
+  template:
+    metadata:
+      name: orchestrator-migrate
+    spec:
+      restartPolicy: Never
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: migrate
+          image: ghcr.io/frankasantevanlaarhoven/favl-orchestrator@sha256:0000000000000000000000000000000000000000000000000000000000000000
+          command: ["alembic", "upgrade", "head"]
+          envFrom:
+            - secretRef:
+                name: orchestrator-database
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              cpu: 50m
+              memory: 128Mi
+            limits:
+              memory: 256Mi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: orchestrator
+  namespace: agentic-content-os
+  labels: { app.kubernetes.io/name: orchestrator }
+spec:
+  # Two replicas minimum: a single replica has no availability during a
+  # rollout or a node drain, and `restart: unless-stopped` semantics do not
+  # exist here. SKIP LOCKED makes concurrent outbox publishers safe.
+  replicas: 2
+  revisionHistoryLimit: 3
+  strategy:
+    type: RollingUpdate
+    rollingUpdate: { maxUnavailable: 0, maxSurge: 1 }
+  selector:
+    matchLabels: { app.kubernetes.io/name: orchestrator }
+  template:
+    metadata:
+      labels: { app.kubernetes.io/name: orchestrator }
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8000"
+        prometheus.io/path: /metrics
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        fsGroup: 10001
+        seccompProfile: { type: RuntimeDefault }
+      # Spread across zones so a single zone failure cannot take the service
+      # below quorum.
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels: { app.kubernetes.io/name: orchestrator }
+      containers:
+        - name: orchestrator
+          image: ghcr.io/frankasantevanlaarhoven/favl-orchestrator@sha256:0000000000000000000000000000000000000000000000000000000000000000
+          # Migrations are the Job's responsibility; the pod only serves.
+          command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+          ports:
+            - { name: http, containerPort: 8000 }
+          envFrom:
+            - secretRef: { name: orchestrator-database }
+            - configMapRef: { name: orchestrator-config }
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: ["ALL"] }
+          # Gives a cold start up to 60s without counting against liveness.
+          startupProbe:
+            httpGet: { path: /livez, port: http }
+            periodSeconds: 3
+            failureThreshold: 20
+          livenessProbe:
+            httpGet: { path: /livez, port: http }
+            periodSeconds: 10
+            timeoutSeconds: 2
+            failureThreshold: 3
+          readinessProbe:
+            httpGet: { path: /readyz, port: http }
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 2
+          lifecycle:
+            preStop:
+              # Let the load balancer observe the readiness change before the
+              # process exits, so in-flight requests are not cut.
+              exec: { command: ["sleep", "5"] }
+          resources:
+            requests: { cpu: 100m, memory: 256Mi }
+            limits: { memory: 512Mi }
+          volumeMounts:
+            - { name: tmp, mountPath: /tmp }
+      volumes:
+        - name: tmp
+          emptyDir: {}
+      terminationGracePeriodSeconds: 30
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: orchestrator
+  namespace: agentic-content-os
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels: { app.kubernetes.io/name: orchestrator }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: orchestrator
+  namespace: agentic-content-os
+spec:
+  selector: { app.kubernetes.io/name: orchestrator }
+  ports:
+    - { name: http, port: 8000, targetPort: http }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: connector-registry
+  namespace: agentic-content-os
+  labels: { app.kubernetes.io/name: connector-registry }
+spec:
+  replicas: 2
+  revisionHistoryLimit: 3
+  strategy:
+    type: RollingUpdate
+    rollingUpdate: { maxUnavailable: 0, maxSurge: 1 }
+  selector:
+    matchLabels: { app.kubernetes.io/name: connector-registry }
+  template:
+    metadata:
+      labels: { app.kubernetes.io/name: connector-registry }
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8001"
+        prometheus.io/path: /metrics
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        fsGroup: 10001
+        seccompProfile: { type: RuntimeDefault }
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels: { app.kubernetes.io/name: connector-registry }
+      containers:
+        - name: connector-registry
+          image: ghcr.io/frankasantevanlaarhoven/favl-connector-registry@sha256:0000000000000000000000000000000000000000000000000000000000000000
+          command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8001"]
+          ports:
+            - { name: http, containerPort: 8001 }
+          envFrom:
+            - secretRef: { name: connector-registry-database }
+            - configMapRef: { name: connector-registry-config }
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: ["ALL"] }
+          startupProbe:
+            httpGet: { path: /livez, port: http }
+            periodSeconds: 3
+            failureThreshold: 20
+          livenessProbe:
+            httpGet: { path: /livez, port: http }
+            periodSeconds: 10
+            timeoutSeconds: 2
+            failureThreshold: 3
+          readinessProbe:
+            httpGet: { path: /readyz, port: http }
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 2
+          lifecycle:
+            preStop:
+              exec: { command: ["sleep", "5"] }
+          resources:
+            requests: { cpu: 100m, memory: 256Mi }
+            limits: { memory: 512Mi }
+          volumeMounts:
+            - { name: tmp, mountPath: /tmp }
+      volumes:
+        - name: tmp
+          emptyDir: {}
+      terminationGracePeriodSeconds: 30
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: connector-registry
+  namespace: agentic-content-os
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels: { app.kubernetes.io/name: connector-registry }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: connector-registry
+  namespace: agentic-content-os
+spec:
+  selector: { app.kubernetes.io/name: connector-registry }
+  ports:
+    - { name: http, port: 8001, targetPort: http }

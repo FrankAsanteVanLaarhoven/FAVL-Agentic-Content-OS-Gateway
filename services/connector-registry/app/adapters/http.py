@@ -11,12 +11,13 @@ from __future__ import annotations
 import json
 import logging
 import os
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 
 import httpx
 
 from ..security import outbound
+from ..security.policy import build_policy, rejected_operator_keys
 from ..security.secrets import SecretNotFound, SecretResolver, is_secret_reference
 from ..security.ssrf import OutboundPolicy, SSRFBlocked
 from .base import (
@@ -42,24 +43,10 @@ class HttpAdapter:
         self._secrets = secret_resolver
 
     def _policy(self, config: dict[str, Any]) -> OutboundPolicy:
-        allowed = config.get("allowed_hosts") or []
-        return OutboundPolicy(
-            allowed_hosts=frozenset(allowed),
-            allowed_schemes=tuple(config.get("allowed_schemes", ("https",))),
-            # Only an operator editing the connector can turn this on, and
-            # metadata endpoints stay blocked regardless.
-            allow_private_addresses=bool(config.get("allow_private_addresses", False)),
-            max_redirects=int(config.get("max_redirects", 3)),
-            max_response_bytes=int(
-                config.get("max_response_bytes", DEFAULT_MAX_RESPONSE_BYTES)
-            ),
-            allowed_content_types=tuple(
-                config.get(
-                    "allowed_content_types",
-                    ("application/json", "application/problem+json", "text/plain"),
-                )
-            ),
-        )
+        # Reach-widening settings come from the operator environment, never
+        # from the connector record. A caller who can create a connector must
+        # not be able to authorise reaching the destination they chose.
+        return build_policy(config)
 
     async def validate_config(self, config: dict[str, Any]) -> ValidationResult:
         errors: list[str] = []
@@ -74,12 +61,12 @@ class HttpAdapter:
                 "connector is an SSRF primitive"
             )
 
-        schemes = tuple(config.get("allowed_schemes", ("https",)))
-        if any(s not in ("http", "https") for s in schemes):
-            errors.append("config.allowed_schemes may only contain http or https")
-        if "http" in schemes and not config.get("allow_plaintext_acknowledged"):
+        escalating = rejected_operator_keys(config)
+        if escalating:
             errors.append(
-                "plaintext http requires config.allow_plaintext_acknowledged=true"
+                f"config may not set operator-controlled keys: {escalating}. "
+                "Private addressing and permitted schemes are deployment "
+                "settings; a connector cannot widen its own reach."
             )
 
         for key, value in (config.get("headers") or {}).items():
@@ -118,7 +105,9 @@ class HttpAdapter:
         headers = {"Content-Type": "application/json", "Accept": "application/json"}
         for key, value in (context.config.get("headers") or {}).items():
             headers[key] = (
-                await self._secrets.resolve(value) if is_secret_reference(value) else value
+                await self._secrets.resolve(value)
+                if is_secret_reference(value)
+                else value
             )
         idem_header = context.config.get("idempotency_header")
         if idem_header and request:
@@ -130,7 +119,7 @@ class HttpAdapter:
         return headers
 
     async def health_check(self, context: ConnectorContext) -> HealthResult:
-        started = datetime.now(timezone.utc)
+        started = datetime.now(UTC)
         url = context.config.get("health_url") or context.config.get("base_url")
         if not url:
             return HealthResult(False, "no health_url or base_url configured", started)
@@ -152,7 +141,7 @@ class HttpAdapter:
         except Exception as exc:
             return HealthResult(False, f"{type(exc).__name__}: {exc}"[:200], started)
 
-        latency = (datetime.now(timezone.utc) - started).total_seconds() * 1000
+        latency = (datetime.now(UTC) - started).total_seconds() * 1000
         return HealthResult(
             healthy=200 <= response.status_code < 400,
             detail=f"HTTP {response.status_code}",
@@ -163,14 +152,14 @@ class HttpAdapter:
     async def invoke(
         self, request: InvocationRequest, context: ConnectorContext
     ) -> InvocationResult:
-        started = datetime.now(timezone.utc)
+        started = datetime.now(UTC)
         remaining = request.seconds_remaining(started)
         if remaining <= 0:
             return InvocationResult.failure(
                 ErrorCode.DEADLINE_EXCEEDED,
                 "deadline passed before dispatch",
                 started_at=started,
-                completed_at=datetime.now(timezone.utc),
+                completed_at=datetime.now(UTC),
             )
 
         base_url = str(context.config.get("base_url", "")).rstrip("/")
@@ -184,7 +173,7 @@ class HttpAdapter:
                 ErrorCode.SECRET_NOT_FOUND,
                 exc.reference,
                 started_at=started,
-                completed_at=datetime.now(timezone.utc),
+                completed_at=datetime.now(UTC),
             )
 
         try:
@@ -210,7 +199,7 @@ class HttpAdapter:
                 ErrorCode.UPSTREAM_TIMEOUT,
                 f"{type(exc).__name__}",
                 started_at=started,
-                completed_at=datetime.now(timezone.utc),
+                completed_at=datetime.now(UTC),
                 audit_metadata={"timeout_budget_seconds": round(remaining, 3)},
             )
         except outbound.ResponseTooLarge as exc:
@@ -218,21 +207,21 @@ class HttpAdapter:
                 ErrorCode.RESPONSE_TOO_LARGE,
                 str(exc),
                 started_at=started,
-                completed_at=datetime.now(timezone.utc),
+                completed_at=datetime.now(UTC),
             )
         except outbound.ContentTypeRejected as exc:
             return InvocationResult.failure(
                 ErrorCode.CONTENT_TYPE_REJECTED,
                 str(exc),
                 started_at=started,
-                completed_at=datetime.now(timezone.utc),
+                completed_at=datetime.now(UTC),
             )
         except outbound.TooManyRedirects as exc:
             return InvocationResult.failure(
                 ErrorCode.TOO_MANY_REDIRECTS,
                 str(exc),
                 started_at=started,
-                completed_at=datetime.now(timezone.utc),
+                completed_at=datetime.now(UTC),
             )
         except SSRFBlocked as exc:
             logger.warning(
@@ -244,17 +233,17 @@ class HttpAdapter:
                 ErrorCode.SSRF_BLOCKED,
                 exc.reason,
                 started_at=started,
-                completed_at=datetime.now(timezone.utc),
+                completed_at=datetime.now(UTC),
             )
         except httpx.HTTPError as exc:
             return InvocationResult.failure(
                 ErrorCode.UPSTREAM_UNAVAILABLE,
                 f"{type(exc).__name__}: {exc}"[:300],
                 started_at=started,
-                completed_at=datetime.now(timezone.utc),
+                completed_at=datetime.now(UTC),
             )
 
-        completed = datetime.now(timezone.utc)
+        completed = datetime.now(UTC)
         if 200 <= response.status_code < 300:
             try:
                 parsed = json.loads(response.body) if response.body else {}

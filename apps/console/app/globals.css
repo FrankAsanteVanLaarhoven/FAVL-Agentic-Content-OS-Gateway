@@ -1,0 +1,145 @@
+@import "tailwindcss";
+
+/*
+ * FAVL Command Center design tokens.
+ *
+ * Accent colour carries system state and nothing else. There is no brand
+ * accent: if green appears, something is healthy; if amber appears, something
+ * needs attention. Using colour decoratively would destroy that signal, which
+ * is the whole reason the surface palette is this restrained.
+ */
+
+@theme {
+  /* surfaces, darkest to lightest */
+  --color-void: #0b0c0d;
+  --color-surface: #111214;
+  --color-raised: #17191c;
+  --color-line: #24282e;
+  --color-line-strong: #333941;
+
+  /* text */
+  --color-ink: #f5f5f5;
+  --color-muted: #8b919b;
+  --color-faint: #5a606a;
+
+  /* state — semantic only */
+  --color-ok: #3fb950;
+  --color-warn: #d29922;
+  --color-err: #f85149;
+  --color-info: #39c5cf;
+
+  --font-sans: "Inter var", "Inter", ui-sans-serif, system-ui, -apple-system,
+    "Segoe UI", Roboto, "Helvetica Neue", sans-serif;
+  --font-mono: "JetBrains Mono", "SF Mono", ui-monospace, SFMono-Regular,
+    Menlo, Consolas, monospace;
+
+  /* 8px grid */
+  --spacing: 0.25rem;
+
+  --radius-sm: 4px;
+  --radius-md: 6px;
+  --radius-lg: 10px;
+
+  --ease-out-quart: cubic-bezier(0.25, 1, 0.5, 1);
+}
+
+@layer base {
+  * {
+    border-color: var(--color-line);
+  }
+
+  html {
+    color-scheme: dark;
+  }
+
+  body {
+    background: var(--color-void);
+    color: var(--color-ink);
+    font-family: var(--font-sans);
+    font-feature-settings: "cv02", "cv03", "cv04", "cv11";
+    -webkit-font-smoothing: antialiased;
+    text-rendering: optimizeLegibility;
+    overflow: hidden;
+  }
+
+  /* Numbers in tables must align vertically to be scannable. */
+  .tabular {
+    font-variant-numeric: tabular-nums;
+  }
+
+  ::selection {
+    background: color-mix(in oklab, var(--color-info) 30%, transparent);
+  }
+
+  /* Chrome should be almost invisible until you need it. */
+  ::-webkit-scrollbar {
+    width: 10px;
+    height: 10px;
+  }
+  ::-webkit-scrollbar-track {
+    background: transparent;
+  }
+  ::-webkit-scrollbar-thumb {
+    background: var(--color-line);
+    border-radius: 6px;
+    border: 3px solid transparent;
+    background-clip: content-box;
+  }
+  ::-webkit-scrollbar-thumb:hover {
+    background: var(--color-line-strong);
+    background-clip: content-box;
+  }
+
+  :focus-visible {
+    outline: 1px solid var(--color-info);
+    outline-offset: 1px;
+  }
+}
+
+@layer utilities {
+  .hairline {
+    box-shadow: inset 0 -1px 0 0 var(--color-line);
+  }
+
+  /*
+   * Steady state is still. Only a state transition animates, and only once —
+   * a graph where every node pulses continuously is noise, not information.
+   */
+  @keyframes state-in {
+    from {
+      opacity: 0;
+      transform: translateY(2px);
+    }
+    to {
+      opacity: 1;
+      transform: none;
+    }
+  }
+  .animate-state-in {
+    animation: state-in 180ms var(--ease-out-quart) both;
+  }
+
+  @keyframes pulse-once {
+    0% {
+      box-shadow: 0 0 0 0 currentColor;
+      opacity: 0.9;
+    }
+    100% {
+      box-shadow: 0 0 0 6px transparent;
+      opacity: 1;
+    }
+  }
+  .animate-pulse-once {
+    animation: pulse-once 900ms var(--ease-out-quart) 1;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}

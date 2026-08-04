@@ -5,6 +5,12 @@
 *.pem
 *.key
 
+# Node
+node_modules/
+.next/
+next-env.d.ts
+*.tsbuildinfo
+
 # Python
 __pycache__/
 *.py[cod]

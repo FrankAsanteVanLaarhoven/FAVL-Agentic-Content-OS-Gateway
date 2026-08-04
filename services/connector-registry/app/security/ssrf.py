@@ -10,6 +10,20 @@ then pins the connection to a validated address. Validating the name and
 letting the HTTP client resolve it again separately would leave a DNS
 rebinding window: the second lookup can return an address the first never
 saw.
+
+Two rules make the classification trustworthy:
+
+1. Addresses are NORMALISED before they are classified. An IPv4-mapped IPv6
+   address such as ``::ffff:169.254.169.254`` reaches the same host as
+   ``169.254.169.254``, but on Python 3.11 its ``is_link_local`` is False —
+   the stdlib only began unwrapping v4-mapped forms in 3.12.4. Classifying
+   the raw form would make the guard's correctness depend on the interpreter
+   version, and these services run 3.11 while the test venv runs 3.13. Every
+   embedded-IPv4 form is unwrapped first.
+
+2. Forbidden ranges are declared EXPLICITLY as networks rather than inferred
+   from ``is_private`` / ``is_link_local``. Those properties have changed
+   between Python releases; a hard-coded table cannot.
 """
 
 from __future__ import annotations
@@ -17,21 +31,54 @@ from __future__ import annotations
 import ipaddress
 import socket
 from dataclasses import dataclass, field
+from ipaddress import IPv4Address, IPv4Network, IPv6Address, IPv6Network
 from urllib.parse import urlparse
 
 DEFAULT_ALLOWED_SCHEMES = ("https",)
 
-# Blocked regardless of allowlist. Cloud metadata services are the highest
-# value SSRF target: they hand out instance credentials to anything that can
-# make a plain HTTP request from inside the network.
-METADATA_ADDRESSES = frozenset(
-    {
-        "169.254.169.254",  # AWS / Azure / GCP / DigitalOcean IMDS
-        "169.254.170.2",  # ECS task metadata
-        "100.100.100.200",  # Alibaba Cloud
-        "fd00:ec2::254",  # AWS IMDSv6
-    }
+# Cloud metadata services are the highest-value SSRF target: they hand out
+# instance credentials to anything that can make a plain HTTP request from
+# inside the network. Declared as networks so no string spelling slips by.
+METADATA_NETWORKS: tuple[IPv4Network | IPv6Network, ...] = (
+    IPv4Network("169.254.169.254/32"),  # AWS / Azure / GCP / DigitalOcean IMDS
+    IPv4Network("169.254.170.2/32"),  # ECS task metadata
+    IPv4Network("100.100.100.200/32"),  # Alibaba Cloud
+    IPv6Network("fd00:ec2::254/128"),  # AWS IMDSv6
 )
+
+# Blocked even when a deployment explicitly permits private addresses.
+ALWAYS_FORBIDDEN: tuple[tuple[IPv4Network | IPv6Network, str], ...] = (
+    (IPv4Network("127.0.0.0/8"), "loopback_address"),
+    (IPv6Network("::1/128"), "loopback_address"),
+    (IPv4Network("169.254.0.0/16"), "link_local_address"),
+    (IPv6Network("fe80::/10"), "link_local_address"),
+    (IPv4Network("224.0.0.0/4"), "multicast_address"),
+    (IPv6Network("ff00::/8"), "multicast_address"),
+    (IPv4Network("0.0.0.0/8"), "unspecified_address"),
+    (IPv6Network("::/128"), "unspecified_address"),
+    # Carrier-grade NAT: routable inside many provider networks and a common
+    # path to infrastructure the deployment does not own.
+    (IPv4Network("100.64.0.0/10"), "shared_address_space"),
+)
+
+# Blocked unless the deployment explicitly permits private addressing.
+PRIVATE_NETWORKS: tuple[tuple[IPv4Network | IPv6Network, str], ...] = (
+    (IPv4Network("10.0.0.0/8"), "private_address"),
+    (IPv4Network("172.16.0.0/12"), "private_address"),
+    (IPv4Network("192.168.0.0/16"), "private_address"),
+    (IPv6Network("fc00::/7"), "private_address"),
+    (IPv4Network("192.0.0.0/24"), "reserved_address"),
+    (IPv4Network("192.0.2.0/24"), "reserved_address"),
+    (IPv4Network("198.18.0.0/15"), "reserved_address"),
+    (IPv4Network("198.51.100.0/24"), "reserved_address"),
+    (IPv4Network("203.0.113.0/24"), "reserved_address"),
+    (IPv4Network("240.0.0.0/4"), "reserved_address"),
+    (IPv4Network("255.255.255.255/32"), "broadcast_address"),
+)
+
+# Prefixes that embed an IPv4 address inside an IPv6 one. Each must be
+# unwrapped before classification or the v4 rules above never apply.
+NAT64_PREFIX = IPv6Network("64:ff9b::/96")
 
 
 class SSRFBlocked(Exception):
@@ -47,7 +94,9 @@ class SSRFBlocked(Exception):
 class OutboundPolicy:
     allowed_hosts: frozenset[str] = frozenset()
     allowed_schemes: tuple[str, ...] = DEFAULT_ALLOWED_SCHEMES
-    # Only ever enabled deliberately, for a trusted internal destination.
+    # Operator-controlled only — see app/security/policy.py. A connector's own
+    # configuration must never set this, because that would let the author of
+    # a destination authorise reaching it.
     allow_private_addresses: bool = False
     max_redirects: int = 3
     max_response_bytes: int = 1_048_576
@@ -59,8 +108,8 @@ class OutboundPolicy:
 
     def host_allowed(self, host: str) -> bool:
         host = host.lower().rstrip(".")
-        for entry in self.allowed_hosts:
-            entry = entry.lower().rstrip(".")
+        for raw_entry in self.allowed_hosts:
+            entry = raw_entry.lower().rstrip(".")
             if host == entry:
                 return True
             # A leading dot means "this domain and its subdomains".
@@ -80,39 +129,71 @@ class ValidatedTarget:
     pinned_url: str = field(default="")
 
 
-def _always_forbidden(ip: ipaddress._BaseAddress) -> str | None:
+def normalise_address(ip: IPv4Address | IPv6Address) -> IPv4Address | IPv6Address:
+    """Unwrap any IPv6 form that embeds an IPv4 address.
+
+    ``::ffff:127.0.0.1`` and ``127.0.0.1`` reach the same socket, so they must
+    classify identically. Leaving this to the stdlib would tie the guard's
+    behaviour to the interpreter version.
+    """
+    if not isinstance(ip, IPv6Address):
+        return ip
+
+    mapped = ip.ipv4_mapped
+    if mapped is not None:
+        return mapped
+
+    sixtofour = ip.sixtofour
+    if sixtofour is not None:
+        return sixtofour
+
+    teredo = ip.teredo
+    if teredo is not None:
+        # (server, client) — the client address is the reachable endpoint.
+        return teredo[1]
+
+    if ip in NAT64_PREFIX:
+        return IPv4Address(int(ip) & 0xFFFFFFFF)
+
+    return ip
+
+
+def _match(
+    ip: IPv4Address | IPv6Address,
+    table: tuple[tuple[IPv4Network | IPv6Network, str], ...],
+) -> str | None:
+    for network, reason in table:
+        if ip.version == network.version and ip in network:
+            return reason
+    return None
+
+
+def _always_forbidden(ip: IPv4Address | IPv6Address) -> str | None:
     """Blocked even when private addresses are explicitly permitted.
 
-    `allow_private_addresses` means "this connector may reach our internal
-    network". It must not also mean "this connector may reach the service's
-    own loopback interface", which is where admin endpoints, debug servers
-    and sidecars listen — a materially more dangerous target than a peer
-    service on the LAN.
+    `allow_private_addresses` means "this deployment may reach our internal
+    network". It must not also mean "may reach the service's own loopback
+    interface", which is where admin endpoints, debug servers and sidecars
+    listen — a materially more dangerous target than a peer service.
     """
-    if str(ip) in METADATA_ADDRESSES:
-        return "cloud_metadata_endpoint"
-    if ip.is_loopback:
-        return "loopback_address"
-    if ip.is_link_local:
-        return "link_local_address"
-    if ip.is_multicast:
-        return "multicast_address"
-    if ip.is_unspecified:
-        return "unspecified_address"
-    return None
+    normalised = normalise_address(ip)
+    for network in METADATA_NETWORKS:
+        if normalised.version == network.version and normalised in network:
+            return "cloud_metadata_endpoint"
+    return _match(normalised, ALWAYS_FORBIDDEN)
 
 
-def _address_is_forbidden(ip: ipaddress._BaseAddress) -> str | None:
-    always = _always_forbidden(ip)
+def _address_is_forbidden(ip: IPv4Address | IPv6Address) -> str | None:
+    normalised = normalise_address(ip)
+    always = _always_forbidden(normalised)
     if always:
         return always
-    if ip.is_reserved:
-        return "reserved_address"
-    if getattr(ip, "is_site_local", False):
-        return "site_local_address"
-    if ip.is_private:
-        return "private_address"
-    return None
+    return _match(normalised, PRIVATE_NETWORKS)
+
+
+def classify(ip: IPv4Address | IPv6Address, allow_private: bool) -> str | None:
+    """Single classification entry point used by both code paths."""
+    return _always_forbidden(ip) if allow_private else _address_is_forbidden(ip)
 
 
 def resolve_and_validate(host: str, port: int, policy: OutboundPolicy) -> str:
@@ -130,23 +211,20 @@ def resolve_and_validate(host: str, port: int, policy: OutboundPolicy) -> str:
     if not infos:
         raise SSRFBlocked("dns_resolution_failed", host)
 
-    addresses = []
+    addresses: list[str] = []
     for info in infos:
-        raw = info[4][0]
+        raw = str(info[4][0])
         try:
-            ip = ipaddress.ip_address(raw)
+            parsed = ipaddress.ip_address(raw)
         except ValueError:
             raise SSRFBlocked("unparsable_address", raw) from None
 
-        forbidden = (
-            _address_is_forbidden(ip)
-            if not policy.allow_private_addresses
-            # Loopback, link-local, multicast and metadata stay blocked even
-            # for an explicitly private-allowed target.
-            else _always_forbidden(ip)
-        )
+        ip = normalise_address(parsed)
+        forbidden = classify(ip, policy.allow_private_addresses)
         if forbidden:
             raise SSRFBlocked(forbidden, f"{host} -> {raw}")
+        # Connect to the normalised form so the socket goes where the check
+        # was made, not to the wrapper form that skipped it.
         addresses.append(str(ip))
 
     return addresses[0]
@@ -177,6 +255,19 @@ def validate_static(url: str, policy: OutboundPolicy) -> tuple[str, str, int]:
 
     if not policy.host_allowed(host):
         raise SSRFBlocked("host_not_allowlisted", host)
+
+    # A literal address in the URL skips DNS entirely, so classify it here as
+    # well as in resolve_and_validate.
+    try:
+        literal_ip: IPv4Address | IPv6Address | None = ipaddress.ip_address(
+            host.strip("[]")
+        )
+    except ValueError:
+        literal_ip = None
+    if literal_ip is not None:
+        forbidden = classify(literal_ip, policy.allow_private_addresses)
+        if forbidden:
+            raise SSRFBlocked(forbidden, host)
 
     return scheme, host, parsed.port or (443 if scheme == "https" else 80)
 

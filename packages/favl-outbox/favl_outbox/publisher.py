@@ -31,17 +31,18 @@ cannot become an implicit cross-service persistence layer.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import random
 import time
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from sqlalchemy import func, select
 from sqlalchemy.exc import SQLAlchemyError
-from sqlalchemy.ext.asyncio import async_sessionmaker
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from . import metrics
 from .envelope import envelope_from_row
@@ -58,6 +59,13 @@ DEFAULT_RETRY_POLICY = RetryPolicy(
 )
 
 
+# Module-level generator so callers need not thread one through. Retry jitter
+# is scheduling noise whose only job is to desynchronise concurrent retries;
+# it never gates access to anything, so a cryptographic generator would buy
+# nothing and cost entropy.
+_JITTER_RNG = random.Random()  # noqa: S311
+
+
 def compute_backoff(
     attempts: int,
     rng: random.Random | None = None,
@@ -68,10 +76,10 @@ def compute_backoff(
     Jitter prevents a broker outage from producing a synchronised retry storm
     when many rows become due at the same instant.
     """
-    rng = rng or random
+    generator = rng if rng is not None else _JITTER_RNG
     raw = min(policy.base_seconds * (2 ** max(attempts - 1, 0)), policy.cap_seconds)
     jitter = raw * policy.jitter_ratio
-    return max(0.1, raw + rng.uniform(-jitter, jitter))
+    return max(0.1, float(raw + generator.uniform(-jitter, jitter)))
 
 
 @dataclass
@@ -96,7 +104,7 @@ class OutboxPublisher:
         self,
         *,
         service: str,
-        session_factory: async_sessionmaker,
+        session_factory: async_sessionmaker[AsyncSession],
         model: Any,
         connection: Any,
         retry_policy: RetryPolicy = DEFAULT_RETRY_POLICY,
@@ -114,7 +122,7 @@ class OutboxPublisher:
         self._batch_size = batch_size
         self._poll_interval = poll_interval
         self._idle_interval = idle_interval
-        self._task: asyncio.Task | None = None
+        self._task: asyncio.Task[None] | None = None
         self._stop = asyncio.Event()
         self.last_error: str | None = None
 
@@ -134,10 +142,8 @@ class OutboxPublisher:
             return
         self._stop.set()
         self._task.cancel()
-        try:
+        with contextlib.suppress(asyncio.CancelledError):
             await self._task
-        except asyncio.CancelledError:
-            pass
         self._task = None
         logger.info("outbox.publisher_stopped service=%s", self.service)
 
@@ -159,10 +165,10 @@ class OutboxPublisher:
                 self.last_error = str(exc)
                 logger.exception("outbox.drain_error service=%s", self.service)
                 delay = self._idle_interval
-            try:
+            # A timeout here is the normal path: it means the stop signal did
+            # not arrive before the next poll was due.
+            with contextlib.suppress(TimeoutError):
                 await asyncio.wait_for(self._stop.wait(), timeout=delay)
-            except (TimeoutError, asyncio.TimeoutError):
-                pass
 
     # ------------------------------------------------------------------ #
     # draining
@@ -172,39 +178,40 @@ class OutboxPublisher:
         """Claim and publish one batch. Safe to call from tests directly."""
         result = DrainResult()
         started = time.perf_counter()
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
 
         try:
-            async with self._session_factory() as session:
-                async with session.begin():
-                    rows = (
-                        (
-                            await session.execute(
-                                select(self._model)
-                                .where(
-                                    self._model.status == STATUS_PENDING,
-                                    self._model.next_attempt_at <= now,
-                                )
-                                .order_by(self._model.created_at)
-                                .limit(self._batch_size)
-                                .with_for_update(skip_locked=True)
+            async with self._session_factory() as session, session.begin():
+                rows = (
+                    (
+                        await session.execute(
+                            select(self._model)
+                            .where(
+                                self._model.status == STATUS_PENDING,
+                                self._model.next_attempt_at <= now,
                             )
+                            .order_by(self._model.created_at)
+                            .limit(self._batch_size)
+                            .with_for_update(skip_locked=True)
                         )
-                        .scalars()
-                        .all()
                     )
-                    result.claimed = len(rows)
-                    if rows:
-                        metrics.CLAIMED.labels(self.service).inc(len(rows))
+                    .scalars()
+                    .all()
+                )
+                result.claimed = len(rows)
+                if rows:
+                    metrics.CLAIMED.labels(self.service).inc(len(rows))
 
-                    for row in rows:
-                        await self._publish_row(row, result)
+                for row in rows:
+                    await self._publish_row(row, result)
         except SQLAlchemyError:
             # Includes lock_timeout and statement_timeout on the claim query.
             metrics.CLAIM_TIMEOUT.labels(self.service).inc()
             raise
 
-        metrics.DRAIN_LATENCY.labels(self.service).observe(time.perf_counter() - started)
+        metrics.DRAIN_LATENCY.labels(self.service).observe(
+            time.perf_counter() - started
+        )
         return result
 
     async def _publish_row(self, row: Any, result: DrainResult) -> None:
@@ -216,9 +223,11 @@ class OutboxPublisher:
             self._record_failure(row, exc, result)
             return
 
-        metrics.PUBLISH_LATENCY.labels(self.service).observe(time.perf_counter() - started)
+        metrics.PUBLISH_LATENCY.labels(self.service).observe(
+            time.perf_counter() - started
+        )
         row.status = STATUS_PUBLISHED
-        row.published_at = datetime.now(timezone.utc)
+        row.published_at = datetime.now(UTC)
         row.stream_seq = getattr(ack, "seq", None)
         row.last_error = None
         result.published += 1
@@ -259,7 +268,7 @@ class OutboxPublisher:
             return
 
         delay = compute_backoff(row.attempts, policy=self.retry_policy)
-        row.next_attempt_at = datetime.now(timezone.utc) + timedelta(seconds=delay)
+        row.next_attempt_at = datetime.now(UTC) + timedelta(seconds=delay)
         metrics.RETRY.labels(self.service, row.subject).inc()
         logger.warning(
             "outbox.publish_failed service=%s event_id=%s subject=%s "
@@ -279,15 +288,14 @@ class OutboxPublisher:
 
     async def stats(self) -> OutboxStats:
         async with self._session_factory() as session:
-            counts = dict(
-                (
-                    await session.execute(
-                        select(self._model.status, func.count()).group_by(
-                            self._model.status
-                        )
+            rows = (
+                await session.execute(
+                    select(self._model.status, func.count()).group_by(
+                        self._model.status
                     )
-                ).all()
-            )
+                )
+            ).all()
+            counts: dict[str, int] = {str(status): int(n) for status, n in rows}
             oldest = (
                 await session.execute(
                     select(func.min(self._model.created_at)).where(
@@ -298,7 +306,7 @@ class OutboxPublisher:
 
         age = None
         if oldest is not None:
-            age = (datetime.now(timezone.utc) - oldest).total_seconds()
+            age = (datetime.now(UTC) - oldest).total_seconds()
 
         return OutboxStats(
             pending=int(counts.get(STATUS_PENDING, 0)),

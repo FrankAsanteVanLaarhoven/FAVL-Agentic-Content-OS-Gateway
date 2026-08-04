@@ -3,7 +3,7 @@
 import asyncio
 import json
 import sys
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -28,7 +28,10 @@ from app.adapters.registry import (  # noqa: E402
     build_registry,
 )
 from app.adapters.webhook import build_signature, verify_signature  # noqa: E402
-from app.security.outbound import STRIPPED_REQUEST_HEADERS, sanitise_headers  # noqa: E402
+from app.security.outbound import (  # noqa: E402
+    STRIPPED_REQUEST_HEADERS,
+    sanitise_headers,
+)
 from app.security.secrets import (  # noqa: E402
     EnvSecretResolver,
     SecretNotFound,
@@ -86,7 +89,9 @@ def test_every_registered_adapter_satisfies_the_protocol():
 
 def test_internal_adapter_requires_a_registered_service():
     adapter = InternalAdapter(registry={"document-parser": "http://parser:8080"})
-    assert run(adapter.validate_config({"service": "document-parser", "operation": "x"})).valid
+    assert run(
+        adapter.validate_config({"service": "document-parser", "operation": "x"})
+    ).valid
     report = run(adapter.validate_config({"service": "unknown", "operation": "x"}))
     assert not report.valid
     assert "not registered" in report.errors[0]
@@ -193,19 +198,61 @@ def test_http_adapter_requires_an_allowlist():
     assert any("allowed_hosts is required" in e for e in report.errors)
 
 
-def test_http_adapter_requires_acknowledgement_for_plaintext():
+@pytest.mark.parametrize(
+    "key,value",
+    [
+        ("allow_private_addresses", True),
+        ("allowed_schemes", ["http"]),
+        ("allow_plaintext_acknowledged", True),
+    ],
+)
+def test_connector_config_cannot_widen_outbound_reach(key, value):
+    """The author of a destination must not be able to authorise reaching it.
+
+    These keys previously came from the connector record, so any principal
+    who could create a connector could point a hostname at RFC1918 space,
+    set allow_private_addresses, and turn the gateway into an authenticated
+    proxy into the internal network.
+    """
     adapter = build_registry().get("http")
     report = run(
         adapter.validate_config(
             {
-                "base_url": "http://api.example.com",
+                "base_url": "https://api.example.com",
                 "allowed_hosts": ["api.example.com"],
-                "allowed_schemes": ["http"],
+                key: value,
             }
         )
     )
     assert not report.valid
-    assert any("allow_plaintext_acknowledged" in e for e in report.errors)
+    assert any("operator-controlled" in e for e in report.errors)
+
+
+def test_operator_policy_ignores_connector_supplied_private_flag(monkeypatch):
+    """Even if the key reached the policy builder, it must have no effect."""
+    from app.security.policy import build_policy
+
+    monkeypatch.delenv("OUTBOUND_ALLOW_PRIVATE_ADDRESSES", raising=False)
+    policy = build_policy(
+        {"allowed_hosts": ["api.example.com"], "allow_private_addresses": True}
+    )
+    assert policy.allow_private_addresses is False
+
+
+def test_operator_env_is_the_only_way_to_permit_private(monkeypatch):
+    from app.security.policy import build_policy
+
+    monkeypatch.setenv("OUTBOUND_ALLOW_PRIVATE_ADDRESSES", "true")
+    assert build_policy({"allowed_hosts": ["svc"]}).allow_private_addresses is True
+
+
+def test_operator_host_allowlist_is_an_upper_bound(monkeypatch):
+    """A connector may choose from what the operator permits, never add."""
+    from app.security.policy import build_policy
+
+    monkeypatch.setenv("OUTBOUND_HOST_ALLOWLIST", "api.example.com")
+    policy = build_policy({"allowed_hosts": ["api.example.com", "evil.example.net"]})
+    assert policy.allowed_hosts == frozenset({"api.example.com"})
 
 
 def test_http_adapter_rejects_a_literal_auth_header():
@@ -228,7 +275,10 @@ def test_idempotency_mode_reflects_provider_support():
     adapter = build_registry().get("http")
     without = run(
         adapter.validate_config(
-            {"base_url": "https://api.example.com", "allowed_hosts": ["api.example.com"]}
+            {
+                "base_url": "https://api.example.com",
+                "allowed_hosts": ["api.example.com"],
+            }
         )
     )
     with_header = run(
@@ -253,7 +303,9 @@ def test_idempotency_mode_reflects_provider_support():
     "header", ["Authorization", "Cookie", "X-API-Key", "Proxy-Authorization", "Host"]
 )
 def test_inbound_credentials_are_never_forwarded(header):
-    assert header not in sanitise_headers({header: "secret", "Accept": "application/json"})
+    assert header not in sanitise_headers(
+        {header: "secret", "Accept": "application/json"}
+    )
 
 
 def test_sanitiser_keeps_ordinary_headers():
@@ -299,7 +351,11 @@ def test_redaction_never_returns_the_value():
 
 @pytest.mark.parametrize(
     "code",
-    [ErrorCode.UPSTREAM_TIMEOUT, ErrorCode.UPSTREAM_UNAVAILABLE, ErrorCode.UPSTREAM_ERROR],
+    [
+        ErrorCode.UPSTREAM_TIMEOUT,
+        ErrorCode.UPSTREAM_UNAVAILABLE,
+        ErrorCode.UPSTREAM_ERROR,
+    ],
 )
 def test_transient_failures_are_retryable(code):
     assert InvocationResult.failure(code).retryable
@@ -332,7 +388,10 @@ def test_timeout_maps_to_its_own_terminal_status():
 
 
 def test_error_detail_is_bounded():
-    assert len(InvocationResult.failure(ErrorCode.UPSTREAM_ERROR, "x" * 5000).error_detail) <= 1000
+    assert (
+        len(InvocationResult.failure(ErrorCode.UPSTREAM_ERROR, "x" * 5000).error_detail)
+        <= 1000
+    )
 
 
 # ------------------------------------------------------------------ #
@@ -341,7 +400,7 @@ def test_error_detail_is_bounded():
 
 
 def _request(deadline_offset: float) -> InvocationRequest:
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     return InvocationRequest(
         invocation_id="i",
         connector_id="c",
@@ -355,11 +414,11 @@ def _request(deadline_offset: float) -> InvocationRequest:
 
 
 def test_remaining_budget_shrinks_towards_the_deadline():
-    assert 0 < _request(5).seconds_remaining(datetime.now(timezone.utc)) <= 5
+    assert 0 < _request(5).seconds_remaining(datetime.now(UTC)) <= 5
 
 
 def test_expired_deadline_yields_no_budget():
-    assert _request(-1).seconds_remaining(datetime.now(timezone.utc)) == 0.0
+    assert _request(-1).seconds_remaining(datetime.now(UTC)) == 0.0
 
 
 def test_context_carries_references_not_secret_values():

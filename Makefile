@@ -38,3 +38,25 @@ validate:
 
 clean-venv:
 	rm -rf $(VENV)
+
+# Each service uses the package name `app`, so they cannot be type-checked in
+# one invocation; mypy is run once per project root with the shared package on
+# MYPYPATH exactly as the containers resolve it.
+MYPY = env -u PYTHONPATH MYPYPATH=$(PWD)/packages/favl-outbox $(PWD)/.venv/bin/mypy --config-file $(PWD)/pyproject.toml
+
+.PHONY: lint format typecheck check
+lint: venv
+	env -u PYTHONPATH .venv/bin/ruff check .
+	env -u PYTHONPATH .venv/bin/ruff format --check .
+
+format: venv
+	env -u PYTHONPATH .venv/bin/ruff check . --fix
+	env -u PYTHONPATH .venv/bin/ruff format .
+
+typecheck: venv
+	$(MYPY) packages/favl-outbox/favl_outbox
+	cd services/orchestrator && $(MYPY) app
+	cd services/connector-registry && $(MYPY) app
+
+# Everything CI runs, in the order CI runs it.
+check: lint typecheck test

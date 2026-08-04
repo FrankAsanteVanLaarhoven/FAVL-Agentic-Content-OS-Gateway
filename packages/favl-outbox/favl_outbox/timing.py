@@ -28,7 +28,7 @@ class RetryPolicy:
     def backoff_for(self, attempt: int) -> float:
         """Upper bound of the delay scheduled after `attempt` failures."""
         raw = min(self.base_seconds * (2 ** max(attempt - 1, 0)), self.cap_seconds)
-        return raw * (1 + self.jitter_ratio)
+        return float(raw * (1 + self.jitter_ratio))
 
 
 @dataclass(frozen=True)
@@ -56,9 +56,7 @@ class DuplicateWindowTooSmall(RuntimeError):
     """Configuration would let a retry escape deduplication."""
 
 
-def worst_case_retry_horizon(
-    policy: RetryPolicy, delays: OperationalDelays
-) -> float:
+def worst_case_retry_horizon(policy: RetryPolicy, delays: OperationalDelays) -> float:
     """Longest possible span from first publish attempt to final attempt.
 
     Every attempt pays the operational cost; every gap between attempts pays

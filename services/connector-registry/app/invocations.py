@@ -10,14 +10,15 @@ import asyncio
 import logging
 import uuid
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
-from favl_outbox import enqueue
 from prometheus_client import Counter, Gauge, Histogram
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
+
+from favl_outbox import enqueue
 
 from .adapters.base import (
     ConnectorContext,
@@ -184,12 +185,20 @@ async def accept(
         ).inc()
         return existing, ReplayedInvocation(existing, in_flight)
 
-    now = datetime.now(timezone.utc)
+    # Read every ORM attribute we will need AFTER a possible rollback into
+    # locals first. session.rollback() expires the identity map, so touching
+    # `connector.kind` in the IntegrityError branch would trigger a lazy
+    # refresh from inside an exception handler and raise MissingGreenlet.
+    connector_id = connector.id
+    connector_kind = connector.kind
+    connector_version = connector.version
+
+    now = datetime.now(UTC)
     record = InvocationRecord(
         id=uuid.uuid4(),
-        connector_id=connector.id,
-        connector_version=connector.version,
-        adapter_kind=connector.kind,
+        connector_id=connector_id,
+        connector_version=connector_version,
+        adapter_kind=connector_kind,
         idempotency_key=idempotency_key,
         actor_id=actor_id,
         tenant_id=tenant_id,
@@ -205,13 +214,14 @@ async def accept(
         await session.flush()
     except IntegrityError:
         # Concurrent request with the same key won the race. Reuse its row.
+        # Only locals captured before the flush are safe to read here.
         await session.rollback()
         existing = await find_existing(
-            session, tenant_id, connector.id, idempotency_key
+            session, tenant_id, connector_id, idempotency_key
         )
         if existing is None:
             raise
-        INVOCATION_RETRIES.labels(connector.kind, "race").inc()
+        INVOCATION_RETRIES.labels(connector_kind, "race").inc()
         return existing, ReplayedInvocation(existing, True)
 
     _emit(session, record, "connector.invocation.accepted")
@@ -238,7 +248,7 @@ async def execute(
         )
 
     record.status = InvocationStatus.RUNNING.value
-    record.started_at = datetime.now(timezone.utc)
+    record.started_at = datetime.now(UTC)
     record.aggregate_version += 1
     _emit(session, record, "connector.invocation.started")
     await session.commit()
@@ -263,7 +273,7 @@ async def execute(
         attempt=record.attempt,
     )
 
-    budget = request.seconds_remaining(datetime.now(timezone.utc))
+    budget = request.seconds_remaining(datetime.now(UTC))
     INVOCATIONS_IN_FLIGHT.labels(connector.kind).inc()
     try:
         # The deadline is enforced here as well as inside the adapter, so an
@@ -272,23 +282,25 @@ async def execute(
         result = await asyncio.wait_for(
             adapter.invoke(request, context), timeout=budget
         )
-    except (TimeoutError, asyncio.TimeoutError):
+    except TimeoutError:
         INVOCATION_TIMEOUTS.labels(connector.kind).inc()
         result = InvocationResult.failure(
             ErrorCode.UPSTREAM_TIMEOUT,
             f"adapter exceeded the {budget:.1f}s deadline",
             started_at=record.started_at,
-            completed_at=datetime.now(timezone.utc),
+            completed_at=datetime.now(UTC),
         )
     except Exception as exc:
         logger.exception(
-            "invocation.adapter_error invocation_id=%s kind=%s", record.id, connector.kind
+            "invocation.adapter_error invocation_id=%s kind=%s",
+            record.id,
+            connector.kind,
         )
         result = InvocationResult.failure(
             ErrorCode.UPSTREAM_ERROR,
             f"{type(exc).__name__}: {exc}"[:500],
             started_at=record.started_at,
-            completed_at=datetime.now(timezone.utc),
+            completed_at=datetime.now(UTC),
         )
     finally:
         INVOCATIONS_IN_FLIGHT.labels(connector.kind).dec()
@@ -311,7 +323,7 @@ async def _finalise(
     result: InvocationResult,
     kind: str,
 ) -> InvocationRecord:
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     record.status = result.status.value
     record.completed_at = result.completed_at or now
     record.started_at = record.started_at or result.started_at or now

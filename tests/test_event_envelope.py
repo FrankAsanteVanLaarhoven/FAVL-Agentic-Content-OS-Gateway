@@ -6,7 +6,7 @@ correct when it does.
 
 import sys
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -36,7 +36,7 @@ class FakeRow:
     aggregate_version: int = 3
     schema_version: int = SCHEMA_VERSION
     created_at: datetime = field(
-        default_factory=lambda: datetime(2026, 8, 4, 12, 0, tzinfo=timezone.utc)
+        default_factory=lambda: datetime(2026, 8, 4, 12, 0, tzinfo=UTC)
     )
     payload: dict[str, Any] = field(default_factory=lambda: {"name": "research"})
 

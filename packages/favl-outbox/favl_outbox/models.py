@@ -8,7 +8,7 @@ is shared at the data layer — only this code.
 from __future__ import annotations
 
 import uuid
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 
 from sqlalchemy import (
@@ -20,6 +20,7 @@ from sqlalchemy import (
     String,
     Text,
     func,
+    text,
 )
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column
@@ -35,13 +36,13 @@ DEFAULT_MAX_ATTEMPTS = 8
 
 
 def _utcnow() -> datetime:
-    return datetime.now(timezone.utc)
+    return datetime.now(UTC)
 
 
 def make_outbox_model(base: Any) -> Any:
     """Bind the outbox table to a service's declarative Base."""
 
-    class OutboxEvent(base):  # type: ignore[misc, valid-type]
+    class OutboxEvent(base):  # type: ignore[misc]
         __tablename__ = TABLE_NAME
         __table_args__ = (
             CheckConstraint(
@@ -50,10 +51,24 @@ def make_outbox_model(base: Any) -> Any:
             ),
             # Partial index: the publisher only ever scans pending rows, and
             # published rows dominate the table over time.
+            #
+            # The predicate MUST be textually identical to migration 0002's.
+            # A previous version used `func.lower("status")`, which SQLAlchemy
+            # coerces to a bound literal rather than a column reference: it
+            # compiled to `WHERE lower('status') = 'pending'`, a constant
+            # false, producing a permanently empty index that Postgres would
+            # never match to the publisher's plain-equality claim query.
             Index(
                 "ix_outbox_events_due",
                 "next_attempt_at",
-                postgresql_where=(func.lower("status") == STATUS_PENDING),
+                postgresql_where=text("status = 'pending'"),
+            ),
+            # Covers the claim query's ORDER BY created_at within the pending
+            # set, so draining a backlog is an index scan rather than a sort.
+            Index(
+                "ix_outbox_events_claim",
+                "created_at",
+                postgresql_where=text("status = 'pending'"),
             ),
             Index("ix_outbox_events_status", "status"),
         )
@@ -79,7 +94,10 @@ def make_outbox_model(base: Any) -> Any:
         payload: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
 
         status: Mapped[str] = mapped_column(
-            String(16), nullable=False, default=STATUS_PENDING, server_default=STATUS_PENDING
+            String(16),
+            nullable=False,
+            default=STATUS_PENDING,
+            server_default=STATUS_PENDING,
         )
         attempts: Mapped[int] = mapped_column(
             Integer, nullable=False, default=0, server_default="0"

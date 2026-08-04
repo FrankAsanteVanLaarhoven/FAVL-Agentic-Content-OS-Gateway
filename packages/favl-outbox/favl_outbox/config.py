@@ -31,10 +31,18 @@ SAFETY_MARGIN = float(os.getenv("OUTBOX_WINDOW_SAFETY_MARGIN", "0.75"))
 
 def retry_policy_from_env() -> RetryPolicy:
     return RetryPolicy(
-        max_attempts=int(os.getenv("OUTBOX_MAX_ATTEMPTS", str(DEFAULT_RETRY_POLICY.max_attempts))),
-        base_seconds=float(os.getenv("OUTBOX_BACKOFF_BASE", str(DEFAULT_RETRY_POLICY.base_seconds))),
-        cap_seconds=float(os.getenv("OUTBOX_BACKOFF_CAP", str(DEFAULT_RETRY_POLICY.cap_seconds))),
-        jitter_ratio=float(os.getenv("OUTBOX_JITTER_RATIO", str(DEFAULT_RETRY_POLICY.jitter_ratio))),
+        max_attempts=int(
+            os.getenv("OUTBOX_MAX_ATTEMPTS", str(DEFAULT_RETRY_POLICY.max_attempts))
+        ),
+        base_seconds=float(
+            os.getenv("OUTBOX_BACKOFF_BASE", str(DEFAULT_RETRY_POLICY.base_seconds))
+        ),
+        cap_seconds=float(
+            os.getenv("OUTBOX_BACKOFF_CAP", str(DEFAULT_RETRY_POLICY.cap_seconds))
+        ),
+        jitter_ratio=float(
+            os.getenv("OUTBOX_JITTER_RATIO", str(DEFAULT_RETRY_POLICY.jitter_ratio))
+        ),
     )
 
 

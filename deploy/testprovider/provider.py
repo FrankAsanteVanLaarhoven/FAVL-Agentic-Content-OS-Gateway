@@ -28,7 +28,7 @@ def expected_signature(event_id: str, timestamp: str, body: bytes) -> str:
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
-    def log_message(self, fmt, *args):  # noqa: A003
+    def log_message(self, fmt, *args):
         print("provider:", fmt % args, flush=True)
 
     def _send(self, code: int, payload, content_type="application/json"):
@@ -44,7 +44,7 @@ class Handler(BaseHTTPRequestHandler):
         length = int(self.headers.get("Content-Length", "0"))
         return self.rfile.read(length) if length else b""
 
-    def do_GET(self):  # noqa: N802
+    def do_GET(self):
         route = urlparse(self.path)
         query = parse_qs(route.query)
 
@@ -64,7 +64,7 @@ class Handler(BaseHTTPRequestHandler):
             return None
         return self._send(404, {"error": "not found"})
 
-    def do_POST(self):  # noqa: N802
+    def do_POST(self):
         route = urlparse(self.path)
         query = parse_qs(route.query)
         body = self._read_body()
@@ -74,7 +74,9 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, {"slept": True})
 
         if route.path == "/fail":
-            return self._send(int(query.get("code", ["500"])[0]), {"error": "provider failure"})
+            return self._send(
+                int(query.get("code", ["500"])[0]), {"error": "provider failure"}
+            )
 
         if route.path == "/webhook":
             event_id = self.headers.get("X-FAVL-Event-ID", "")
@@ -90,9 +92,8 @@ class Handler(BaseHTTPRequestHandler):
                     "timestamp": timestamp,
                     "attempt": attempt,
                     "signature_valid": valid,
-                    "has_authorization_header": "authorization" in {
-                        k.lower() for k in self.headers.keys()
-                    },
+                    "has_authorization_header": "authorization"
+                    in {k.lower() for k in self.headers},
                     "body_sha256": hashlib.sha256(body).hexdigest(),
                 }
             )
@@ -112,7 +113,7 @@ class Handler(BaseHTTPRequestHandler):
                     "idempotency_key": self.headers.get("X-FAVL-Idempotency-Key"),
                     "invocation_id": self.headers.get("X-FAVL-Invocation-ID"),
                     "saw_authorization": "authorization"
-                    in {k.lower() for k in self.headers.keys()},
+                    in {k.lower() for k in self.headers},
                 },
             )
 

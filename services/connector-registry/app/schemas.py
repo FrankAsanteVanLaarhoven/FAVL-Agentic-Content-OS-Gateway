@@ -16,6 +16,14 @@ FORBIDDEN_CONFIG_KEYS = frozenset(
     {"signing_secret", "api_key", "password", "token", "client_secret", "private_key"}
 )
 
+# Settings that would WIDEN outbound reach. They are deployment policy, read
+# from the operator environment. Accepting them here would let the author of
+# a destination authorise the gateway to reach it — the connector equivalent
+# of marking your own homework.
+OPERATOR_ONLY_CONFIG_KEYS = frozenset(
+    {"allow_private_addresses", "allowed_schemes", "allow_plaintext_acknowledged"}
+)
+
 
 class ConnectorStatusSchema(str, Enum):
     DRAFT = "draft"
@@ -53,6 +61,18 @@ class ConnectorCreate(BaseModel):
             raise ValueError(
                 f"config may not contain literal secrets: {offending}. "
                 "Use a reference such as env:NAME with a *_ref key."
+            )
+        return value
+
+    @field_validator("config")
+    @classmethod
+    def _no_privilege_escalation(cls, value: dict[str, Any]) -> dict[str, Any]:
+        escalating = sorted(OPERATOR_ONLY_CONFIG_KEYS.intersection(value))
+        if escalating:
+            raise ValueError(
+                f"config may not set operator-controlled keys: {escalating}. "
+                "Private addressing and permitted schemes are deployment "
+                "settings; a connector cannot widen its own reach."
             )
         return value
 

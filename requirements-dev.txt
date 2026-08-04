@@ -8,3 +8,13 @@ prometheus-client==0.22.1
 httpx==0.28.1
 pytest==8.4.1
 pytest-asyncio==1.1.0
+ruff==0.13.1
+mypy==1.18.2
+types-requests==2.32.4.20250913
+
+# Runtime dependencies of the services, required for type-checking them.
+# Without fastapi installed, mypy treats every route decorator as untyped and
+# the strict-mode errors are noise rather than signal.
+fastapi==0.116.1
+asyncpg==0.30.0
+alembic==1.16.4

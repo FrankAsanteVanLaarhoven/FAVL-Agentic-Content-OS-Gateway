@@ -24,7 +24,7 @@ routes:
         discovery: "$env://KEYCLOAK_DISCOVERY"
         bearer_only: true
         realm: favl
-        ssl_verify: false
+        ssl_verify: true
       limit-count:
         count: 300
         time_window: 60
@@ -36,6 +36,16 @@ routes:
         headers:
           set:
             X-Gateway: favl-apisix
+          # Strip caller-supplied identity. The service derives actor and
+          # tenant from X-Userinfo, which openid-connect sets from the
+          # verified token. X-Userinfo is deliberately NOT listed here:
+          # openid-connect (priority 2599) runs before proxy-rewrite (1008),
+          # so removing it would delete the header the gateway just set. Its
+          # overwrite of any client-supplied value is asserted by
+          # tests/verify_identity.sh.
+          remove:
+            - X-Tenant-ID
+            - X-Actor-ID
       prometheus: {}
       opentelemetry:
         sampler:
@@ -64,7 +74,7 @@ routes:
         discovery: "$env://KEYCLOAK_DISCOVERY"
         bearer_only: true
         realm: favl
-        ssl_verify: false
+        ssl_verify: true
       limit-count:
         count: 120
         time_window: 60
@@ -72,10 +82,77 @@ routes:
         key_type: var
         key: remote_addr
         policy: local
+      proxy-rewrite:
+        headers:
+          set:
+            X-Gateway: favl-apisix
+          # Strip caller-supplied identity. The service derives actor and
+          # tenant from X-Userinfo, which openid-connect sets from the
+          # verified token. X-Userinfo is deliberately NOT listed here:
+          # openid-connect (priority 2599) runs before proxy-rewrite (1008),
+          # so removing it would delete the header the gateway just set. Its
+          # overwrite of any client-supplied value is asserted by
+          # tests/verify_identity.sh.
+          remove:
+            - X-Tenant-ID
+            - X-Actor-ID
       prometheus: {}
       opentelemetry:
         sampler:
           name: always_on
+
+  - id: invocations
+    name: invocations
+    # Read-only audit surface. Kept as its own route so its rate limit and
+    # sampling can differ from the connector CRUD path: an operator paging
+    # through history should not exhaust the budget for control operations.
+    uri: /v1/invocations*
+    methods: [GET, OPTIONS]
+    upstream:
+      type: roundrobin
+      nodes:
+        "connector-registry:8001": 1
+    plugins:
+      request-id:
+        header_name: X-Request-ID
+        include_in_response: true
+      openid-connect:
+        client_id: "$env://KEYCLOAK_CLIENT_ID"
+        client_secret: "$env://KEYCLOAK_CLIENT_SECRET"
+        discovery: "$env://KEYCLOAK_DISCOVERY"
+        bearer_only: true
+        realm: favl
+        ssl_verify: true
+      limit-count:
+        count: 600
+        time_window: 60
+        rejected_code: 429
+        key_type: var
+        key: remote_addr
+        policy: local
+      proxy-rewrite:
+        headers:
+          set:
+            X-Gateway: favl-apisix
+          # Strip caller-supplied identity. The service derives actor and
+          # tenant from X-Userinfo, which openid-connect sets from the
+          # verified token. X-Userinfo is deliberately NOT listed here:
+          # openid-connect (priority 2599) runs before proxy-rewrite (1008),
+          # so removing it would delete the header the gateway just set. Its
+          # overwrite of any client-supplied value is asserted by
+          # tests/verify_identity.sh.
+          remove:
+            - X-Tenant-ID
+            - X-Actor-ID
+      prometheus: {}
+      opentelemetry:
+        sampler:
+          name: parent_base
+          options:
+            base_sampler:
+              name: trace_id_ratio
+              options:
+                fraction: 0.05
 
   - id: public-health
     name: public-health

@@ -112,7 +112,7 @@ sleep 12
 check "dead event stops consuming retries" \
   "$(psql_orch "SELECT attempts FROM outbox_events WHERE aggregate_id='poison'")" "$A1"
 check "dead count exposed in readiness" \
-  "$($DC exec -T connector-registry python -c "import httpx;print(httpx.get('http://orchestrator:8000/health/ready',timeout=10).json()['outbox']['dead'])" | tr -d ' \r')" "1"
+  "$($DC exec -T connector-registry python -c "import httpx;print(httpx.get('http://orchestrator:8000/readyz',timeout=10).json()['outbox']['dead'])" | tr -d ' \r')" "1"
 psql_orch "DELETE FROM outbox_events WHERE aggregate_id='poison'" >/dev/null
 
 # --------------------------------------------------------------------------

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import uuid
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from enum import Enum
 from typing import Any
 
@@ -25,7 +25,7 @@ from .db import Base
 
 
 def _utcnow() -> datetime:
-    return datetime.now(timezone.utc)
+    return datetime.now(UTC)
 
 
 class ConnectorStatus(str, Enum):
@@ -51,7 +51,8 @@ class ConnectorRecord(Base):
     __tablename__ = "connectors"
     __table_args__ = (
         CheckConstraint(
-            "status IN ('draft', 'enabled', 'disabled', 'deletion_requested', 'deleted')",
+            "status IN ('draft', 'enabled', 'disabled', "
+            "'deletion_requested', 'deleted')",
             name="ck_connectors_status",
         ),
         CheckConstraint(
@@ -74,7 +75,9 @@ class ConnectorRecord(Base):
         JSONB, nullable=False, default=dict, server_default="{}"
     )
     status: Mapped[str] = mapped_column(
-        String(24), nullable=False, default=ConnectorStatus.ENABLED.value,
+        String(24),
+        nullable=False,
+        default=ConnectorStatus.ENABLED.value,
         server_default=ConnectorStatus.ENABLED.value,
     )
     version: Mapped[int] = mapped_column(
@@ -88,7 +91,10 @@ class ConnectorRecord(Base):
     )
     deleted_by: Mapped[str | None] = mapped_column(String(255), nullable=True)
     created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), nullable=False, default=_utcnow, server_default=func.now()
+        DateTime(timezone=True),
+        nullable=False,
+        default=_utcnow,
+        server_default=func.now(),
     )
 
     @property
@@ -143,7 +149,9 @@ class InvocationRecord(Base):
     attempt: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
     aggregate_version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
 
-    deadline_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    deadline_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
     started_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
@@ -164,5 +172,8 @@ class InvocationRecord(Base):
     )
 
     created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), nullable=False, default=_utcnow, server_default=func.now()
+        DateTime(timezone=True),
+        nullable=False,
+        default=_utcnow,
+        server_default=func.now(),
     )

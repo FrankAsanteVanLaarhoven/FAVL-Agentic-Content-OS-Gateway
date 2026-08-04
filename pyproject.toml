@@ -1,0 +1,95 @@
+[project]
+name = "favl-enterprise-gateway"
+version = "0.1.0"
+description = "Workspace root: tooling configuration for all Python services and packages"
+requires-python = ">=3.11"
+
+# This file is not an installable distribution. Services and packages carry
+# their own pyproject.toml; this one exists so lint, type-check and test
+# configuration is defined once for the whole repository.
+
+[tool.ruff]
+line-length = 88
+target-version = "py311"
+src = [
+  "packages/favl-outbox",
+  "services/orchestrator",
+  "services/connector-registry",
+  "tests",
+]
+extend-exclude = ["**/migrations/versions/*.py", ".venv", "node_modules"]
+
+[tool.ruff.lint]
+select = [
+  "E",    # pycodestyle
+  "W",    # pycodestyle warnings
+  "F",    # pyflakes
+  "I",    # import sorting
+  "N",    # pep8-naming
+  "UP",   # pyupgrade
+  "B",    # bugbear
+  "A",    # builtin shadowing
+  "C4",   # comprehensions
+  "DTZ",  # naive datetime — a timestamp without a timezone is a latent bug
+  "T20",  # no stray print in library code
+  "SIM",  # simplify
+  "TID",  # tidy imports
+  "PTH",  # pathlib over os.path
+  "RUF",  # ruff-specific
+  "S",    # bandit security rules
+  "ASYNC",# async correctness
+]
+ignore = [
+  "S101",   # assert is the correct tool in tests
+  "B008",   # FastAPI Depends() in defaults is the framework idiom
+  "N818",   # exception names here read better without the Error suffix
+  # Relative imports inside a service package are correct and keep the
+  # package relocatable; both services deliberately use the same `app` name.
+  "TID252",
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["S", "T20", "E501", "SIM117"]
+"deploy/testprovider/provider.py" = ["S", "T20"]  # dev-only fixture
+# CLI checkers: stdout is the interface, and the long line is a regex.
+"scripts/*.py" = ["T20", "E501"]
+"**/migrations/env.py" = ["E402"]                 # alembic requires late imports
+# `timeout` is passed straight through to nats-py, which owns the deadline.
+# Wrapping it in asyncio.timeout would double-count the budget.
+"packages/favl-outbox/favl_outbox/jetstream.py" = ["ASYNC109"]
+# S105 fires on the ErrorCode enum member named SECRET_NOT_FOUND; it is an
+# error identifier, not a credential.
+"services/connector-registry/app/adapters/base.py" = ["S105"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["app", "favl_outbox"]
+
+[tool.ruff.format]
+docstring-code-format = true
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+warn_unreachable = true
+warn_return_any = true
+disallow_untyped_defs = true
+no_implicit_reexport = true
+show_error_codes = true
+exclude = ['migrations/versions/.*', '\.venv', 'node_modules']
+mypy_path = "packages/favl-outbox:services/orchestrator:services/connector-registry"
+
+# The declarative Base is produced by a factory, so the ORM classes it yields
+# cannot be statically typed. Confined to the two modules that do this.
+[[tool.mypy.overrides]]
+module = ["favl_outbox.models", "app.outbox"]
+disallow_any_explicit = false
+warn_return_any = false
+
+[[tool.mypy.overrides]]
+module = ["nats.*", "prometheus_client.*", "alembic.*"]
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q --strict-markers --strict-config"
+filterwarnings = ["error::DeprecationWarning:favl_outbox.*"]

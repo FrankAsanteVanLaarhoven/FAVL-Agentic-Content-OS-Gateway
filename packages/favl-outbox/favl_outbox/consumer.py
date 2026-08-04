@@ -12,7 +12,7 @@ downstream decision that depends on which fields are trustworthy.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 
 from prometheus_client import Counter
@@ -73,10 +73,12 @@ def _parse_timestamp(value: Any) -> datetime | None:
         parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
     except ValueError:
         return None
-    return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)
 
 
-def parse_legacy_event(payload: dict[str, Any], subject: str | None = None) -> DomainEvent:
+def parse_legacy_event(
+    payload: dict[str, Any], subject: str | None = None
+) -> DomainEvent:
     """Pre-envelope format: a bare domain body, no identifiers.
 
     Nothing is invented. Fields the old format never carried stay None so a
@@ -87,7 +89,9 @@ def parse_legacy_event(payload: dict[str, Any], subject: str | None = None) -> D
         event_id=None,
         event_type=subject or "unknown",
         aggregate_type=None,
-        aggregate_id=payload.get("agent_id") or payload.get("connector_id") or payload.get("id"),
+        aggregate_id=payload.get("agent_id")
+        or payload.get("connector_id")
+        or payload.get("id"),
         aggregate_version=None,
         occurred_at=_parse_timestamp(payload.get("created_at")),
         schema_version=LEGACY_SCHEMA_VERSION,

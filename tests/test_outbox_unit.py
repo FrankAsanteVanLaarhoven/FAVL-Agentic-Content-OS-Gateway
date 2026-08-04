@@ -7,10 +7,8 @@ transitions are pinned independently of Postgres behaviour.
 import random
 import sys
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
-
-import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "packages" / "favl-outbox"))
@@ -33,9 +31,7 @@ class FakeRow:
     max_attempts: int = 3
     status: str = "pending"
     last_error: str | None = None
-    next_attempt_at: datetime = field(
-        default_factory=lambda: datetime.now(timezone.utc)
-    )
+    next_attempt_at: datetime = field(default_factory=lambda: datetime.now(UTC))
     id: str = "11111111-1111-1111-1111-111111111111"
 
 

@@ -61,9 +61,7 @@ def test_horizon_counts_operational_delay_not_only_backoff():
 def test_each_operational_delay_contributes(field):
     policy = cfg.retry_policy_from_env()
     base = cfg.operational_delays_from_env()
-    bumped = OperationalDelays(
-        **{**base.__dict__, field: getattr(base, field) + 10}
-    )
+    bumped = OperationalDelays(**{**base.__dict__, field: getattr(base, field) + 10})
     assert worst_case_retry_horizon(policy, bumped) > worst_case_retry_horizon(
         policy, base
     )
@@ -75,7 +73,9 @@ def test_restart_delay_is_included():
 
 
 def test_invariant_rejects_a_horizon_that_exceeds_the_window():
-    unsafe = RetryPolicy(max_attempts=200, base_seconds=1.0, cap_seconds=300.0, jitter_ratio=0.25)
+    unsafe = RetryPolicy(
+        max_attempts=200, base_seconds=1.0, cap_seconds=300.0, jitter_ratio=0.25
+    )
     delays = cfg.operational_delays_from_env()
     with pytest.raises(DuplicateWindowTooSmall) as exc:
         validate_duplicate_window(unsafe, delays, cfg.duplicate_window_seconds())
@@ -93,7 +93,6 @@ def test_safety_margin_leaves_headroom():
     """Utilisation is capped below 1.0 so an underestimate is not fatal."""
     policy = cfg.retry_policy_from_env()
     delays = cfg.operational_delays_from_env()
-    window = cfg.duplicate_window_seconds()
     # Sits exactly on the margin: allowed at the margin, rejected just under.
     horizon = worst_case_retry_horizon(policy, delays)
     validate_duplicate_window(policy, delays, horizon / cfg.SAFETY_MARGIN)
