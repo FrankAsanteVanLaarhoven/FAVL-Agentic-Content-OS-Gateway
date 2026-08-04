@@ -16,6 +16,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from .db import SessionLocal, engine, get_session
 from .models import ConnectorRecord
 from .outbox import OutboxEvent, connection, publisher, publisher_enabled
+from .outbox import WINDOW_UTILISATION
 from .schemas import Connector, ConnectorCreate
 
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
@@ -26,6 +27,11 @@ __all__ = ["app", "Connector", "ConnectorCreate"]
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # The invariant is enforced at import, before logging is configured, so
+    # the result is restated here where it is actually visible.
+    logger.info(
+        "outbox.duplicate_window_utilisation=%.1f%%", WINDOW_UTILISATION * 100
+    )
     await connection.connect()
     if publisher_enabled():
         publisher.start()
@@ -56,11 +62,20 @@ def _to_schema(record: ConnectorRecord) -> Connector:
     )
 
 
+@app.get("/livez")
 @app.get("/health/live")
 async def live() -> dict[str, str]:
+    """Liveness: is this process still running its event loop?
+
+    Deliberately checks no external dependency. A liveness probe that fails
+    when PostgreSQL or NATS is down turns a dependency outage into a
+    cluster-wide restart storm, which is strictly worse than a degraded but
+    running service. Dependency state belongs in /readyz.
+    """
     return {"status": "live"}
 
 
+@app.get("/readyz")
 @app.get("/health/ready")
 async def ready() -> dict[str, Any]:
     db_ok = True
@@ -155,6 +170,7 @@ async def create_connector(
         payload=connector.model_dump(mode="json"),
         aggregate_type="connector",
         aggregate_id=str(record.id),
+        aggregate_version=record.version,
     )
     await session.commit()
     return connector
@@ -181,6 +197,7 @@ async def delete_connector(
         payload={"connector_id": str(connector_id), "name": record.name},
         aggregate_type="connector",
         aggregate_id=str(connector_id),
+        aggregate_version=record.version + 1,
     )
     await session.commit()
 

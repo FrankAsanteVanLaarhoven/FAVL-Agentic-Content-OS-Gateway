@@ -2,25 +2,30 @@
 
 Delivery contract
 -----------------
-At-least-once, deduplicated at the stream.
+At-least-once, deduplicated at the stream, with consumer-side deduplication
+required. See envelope.py for why the broker's duplicate window is a safety
+net rather than a guarantee.
 
 A row is claimed with `SELECT ... FOR UPDATE SKIP LOCKED` and published while
 the claiming transaction is still open. Three outcomes:
 
-* publish acked, transaction commits -> row is `published`, exactly once.
+* publish acked, transaction commits -> row is `published`, delivered once.
 * publish fails -> row stays `pending` with a later `next_attempt_at`.
 * publish acked but the process dies before commit -> the transaction rolls
   back and the row returns to `pending`, so it is published a second time.
   That republish carries the same `Nats-Msg-Id` (the row id), so JetStream
   collapses it inside the duplicate window.
 
-The third case is why at-least-once plus dedup is the guarantee rather than
+The third case is why the guarantee is at-least-once plus dedup rather than
 exactly-once. There is no way to commit a database transaction and a broker
-publish atomically without a distributed transaction; the duplicate window is
-what makes the resulting retry harmless.
+publish atomically without a distributed transaction.
 
 `SKIP LOCKED` means several replicas can run this loop concurrently without
 double-claiming a row.
+
+Nothing here imports service ORM models or service settings. The session
+factory, table, connection and retry policy are all injected, so this package
+cannot become an implicit cross-service persistence layer.
 """
 
 from __future__ import annotations
@@ -35,27 +40,37 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from sqlalchemy import func, select
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from . import metrics
+from .envelope import envelope_from_row
 from .models import STATUS_DEAD, STATUS_PENDING, STATUS_PUBLISHED
+from .timing import OperationalDelays, RetryPolicy
 
 logger = logging.getLogger(__name__)
 
-BACKOFF_BASE_SECONDS = 1.0
-BACKOFF_CAP_SECONDS = 300.0
-JITTER_RATIO = 0.25
+DEFAULT_RETRY_POLICY = RetryPolicy(
+    max_attempts=8,
+    base_seconds=1.0,
+    cap_seconds=300.0,
+    jitter_ratio=0.25,
+)
 
 
-def compute_backoff(attempts: int, rng: random.Random | None = None) -> float:
+def compute_backoff(
+    attempts: int,
+    rng: random.Random | None = None,
+    policy: RetryPolicy = DEFAULT_RETRY_POLICY,
+) -> float:
     """Exponential backoff with proportional jitter.
 
     Jitter prevents a broker outage from producing a synchronised retry storm
     when many rows become due at the same instant.
     """
     rng = rng or random
-    raw = min(BACKOFF_BASE_SECONDS * (2 ** max(attempts - 1, 0)), BACKOFF_CAP_SECONDS)
-    jitter = raw * JITTER_RATIO
+    raw = min(policy.base_seconds * (2 ** max(attempts - 1, 0)), policy.cap_seconds)
+    jitter = raw * policy.jitter_ratio
     return max(0.1, raw + rng.uniform(-jitter, jitter))
 
 
@@ -84,11 +99,15 @@ class OutboxPublisher:
         session_factory: async_sessionmaker,
         model: Any,
         connection: Any,
+        retry_policy: RetryPolicy = DEFAULT_RETRY_POLICY,
+        delays: OperationalDelays | None = None,
         batch_size: int = 100,
         poll_interval: float = 0.25,
         idle_interval: float = 1.0,
     ) -> None:
         self.service = service
+        self.retry_policy = retry_policy
+        self.delays = delays
         self._session_factory = session_factory
         self._model = model
         self._conn = connection
@@ -155,34 +174,41 @@ class OutboxPublisher:
         started = time.perf_counter()
         now = datetime.now(timezone.utc)
 
-        async with self._session_factory() as session:
-            async with session.begin():
-                rows = (
-                    (
-                        await session.execute(
-                            select(self._model)
-                            .where(
-                                self._model.status == STATUS_PENDING,
-                                self._model.next_attempt_at <= now,
+        try:
+            async with self._session_factory() as session:
+                async with session.begin():
+                    rows = (
+                        (
+                            await session.execute(
+                                select(self._model)
+                                .where(
+                                    self._model.status == STATUS_PENDING,
+                                    self._model.next_attempt_at <= now,
+                                )
+                                .order_by(self._model.created_at)
+                                .limit(self._batch_size)
+                                .with_for_update(skip_locked=True)
                             )
-                            .order_by(self._model.created_at)
-                            .limit(self._batch_size)
-                            .with_for_update(skip_locked=True)
                         )
+                        .scalars()
+                        .all()
                     )
-                    .scalars()
-                    .all()
-                )
-                result.claimed = len(rows)
+                    result.claimed = len(rows)
+                    if rows:
+                        metrics.CLAIMED.labels(self.service).inc(len(rows))
 
-                for row in rows:
-                    await self._publish_row(session, row, result)
+                    for row in rows:
+                        await self._publish_row(row, result)
+        except SQLAlchemyError:
+            # Includes lock_timeout and statement_timeout on the claim query.
+            metrics.CLAIM_TIMEOUT.labels(self.service).inc()
+            raise
 
-        metrics.DRAIN_DURATION.labels(self.service).observe(time.perf_counter() - started)
+        metrics.DRAIN_LATENCY.labels(self.service).observe(time.perf_counter() - started)
         return result
 
-    async def _publish_row(self, session: Any, row: Any, result: DrainResult) -> None:
-        body = json.dumps(row.payload, default=str).encode()
+    async def _publish_row(self, row: Any, result: DrainResult) -> None:
+        body = json.dumps(envelope_from_row(row), default=str).encode()
         started = time.perf_counter()
         try:
             ack = await self._conn.publish(row.subject, body, msg_id=str(row.id))
@@ -190,20 +216,22 @@ class OutboxPublisher:
             self._record_failure(row, exc, result)
             return
 
-        metrics.PUBLISH_DURATION.labels(self.service).observe(time.perf_counter() - started)
+        metrics.PUBLISH_LATENCY.labels(self.service).observe(time.perf_counter() - started)
         row.status = STATUS_PUBLISHED
         row.published_at = datetime.now(timezone.utc)
         row.stream_seq = getattr(ack, "seq", None)
         row.last_error = None
         result.published += 1
         result.subjects.append(row.subject)
-        metrics.PUBLISHED.labels(self.service, row.subject).inc()
+        metrics.PUBLISH.labels(self.service, row.subject, "success").inc()
         self.last_error = None
         logger.info(
-            "outbox.published service=%s id=%s subject=%s seq=%s duplicate=%s",
+            "outbox.published service=%s event_id=%s subject=%s version=%s "
+            "seq=%s duplicate=%s",
             self.service,
             row.id,
             row.subject,
+            row.aggregate_version,
             row.stream_seq,
             getattr(ack, "duplicate", False),
         )
@@ -212,15 +240,16 @@ class OutboxPublisher:
         row.attempts += 1
         row.last_error = f"{type(exc).__name__}: {exc}"[:2000]
         result.failed += 1
-        metrics.FAILURES.labels(self.service, row.subject).inc()
+        metrics.PUBLISH.labels(self.service, row.subject, "failure").inc()
         self.last_error = row.last_error
 
         if row.attempts >= row.max_attempts:
             row.status = STATUS_DEAD
             result.dead_lettered += 1
-            metrics.DEAD_LETTERED.labels(self.service, row.subject).inc()
+            metrics.DEAD_LETTER.labels(self.service, row.subject).inc()
             logger.error(
-                "outbox.dead_lettered service=%s id=%s subject=%s attempts=%d error=%s",
+                "outbox.dead_lettered service=%s event_id=%s subject=%s "
+                "attempts=%d error=%s",
                 self.service,
                 row.id,
                 row.subject,
@@ -229,11 +258,12 @@ class OutboxPublisher:
             )
             return
 
-        delay = compute_backoff(row.attempts)
+        delay = compute_backoff(row.attempts, policy=self.retry_policy)
         row.next_attempt_at = datetime.now(timezone.utc) + timedelta(seconds=delay)
+        metrics.RETRY.labels(self.service, row.subject).inc()
         logger.warning(
-            "outbox.publish_failed service=%s id=%s subject=%s attempt=%d/%d "
-            "retry_in=%.1fs error=%s",
+            "outbox.publish_failed service=%s event_id=%s subject=%s "
+            "attempt=%d/%d retry_in=%.1fs error=%s",
             self.service,
             row.id,
             row.subject,
@@ -281,7 +311,7 @@ class OutboxPublisher:
         current = await self.stats()
         metrics.PENDING.labels(self.service).set(current.pending)
         metrics.DEAD.labels(self.service).set(current.dead)
-        metrics.OLDEST_PENDING_AGE.labels(self.service).set(
+        metrics.OLDEST_PENDING.labels(self.service).set(
             current.oldest_pending_age_seconds or 0.0
         )
         return current

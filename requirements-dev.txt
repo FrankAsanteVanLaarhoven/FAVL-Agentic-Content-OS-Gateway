@@ -1,0 +1,9 @@
+# Offline test dependencies. Installed into a repository-local .venv by
+# `make test`; the host base environment is not part of the reproducibility
+# contract.
+pydantic==2.11.7
+sqlalchemy[asyncio]==2.0.43
+nats-py==2.11.0
+prometheus-client==0.22.1
+pytest==8.4.1
+pytest-asyncio==1.1.0

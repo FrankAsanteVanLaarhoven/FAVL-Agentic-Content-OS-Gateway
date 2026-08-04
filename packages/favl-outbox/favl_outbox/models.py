@@ -65,7 +65,17 @@ def make_outbox_model(base: Any) -> Any:
         )
         aggregate_type: Mapped[str] = mapped_column(String(64), nullable=False)
         aggregate_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+        # Monotonic per aggregate. Consumers use it to reject stale events and
+        # to detect gaps without trusting stream order.
+        aggregate_version: Mapped[int] = mapped_column(
+            Integer, nullable=False, default=1, server_default="1"
+        )
         subject: Mapped[str] = mapped_column(String(255), nullable=False)
+        schema_version: Mapped[int] = mapped_column(
+            Integer, nullable=False, default=1, server_default="1"
+        )
+        # The domain body only. The wire envelope is built at publish time so
+        # the row stays canonical and the envelope can be versioned.
         payload: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
 
         status: Mapped[str] = mapped_column(

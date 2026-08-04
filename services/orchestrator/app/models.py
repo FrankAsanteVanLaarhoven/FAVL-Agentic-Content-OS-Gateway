@@ -5,7 +5,7 @@ from __future__ import annotations
 import uuid
 from datetime import datetime, timezone
 
-from sqlalchemy import DateTime, String, Text, func
+from sqlalchemy import DateTime, Integer, String, Text, func
 from sqlalchemy.dialects.postgresql import ARRAY, UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -26,6 +26,11 @@ class AgentRecord(Base):
     description: Mapped[str] = mapped_column(Text, nullable=False, default="")
     connector_ids: Mapped[list[str]] = mapped_column(
         ARRAY(String), nullable=False, default=list
+    )
+    # Monotonic per aggregate; stamped onto every emitted event so consumers
+    # can reject stale deliveries without trusting stream order.
+    version: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=1, server_default="1"
     )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, default=_utcnow, server_default=func.now()

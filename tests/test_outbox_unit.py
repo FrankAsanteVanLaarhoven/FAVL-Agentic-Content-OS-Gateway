@@ -16,11 +16,14 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "packages" / "favl-outbox"))
 
 from favl_outbox.publisher import (  # noqa: E402
-    BACKOFF_CAP_SECONDS,
+    DEFAULT_RETRY_POLICY,
     DrainResult,
     OutboxPublisher,
     compute_backoff,
 )
+
+BACKOFF_CAP_SECONDS = DEFAULT_RETRY_POLICY.cap_seconds
+JITTER_RATIO = DEFAULT_RETRY_POLICY.jitter_ratio
 
 
 @dataclass
@@ -55,7 +58,7 @@ def test_backoff_grows_exponentially():
 def test_backoff_is_capped():
     rng = random.Random(0)
     # 2**40 seconds without a cap; jitter may add up to 25% of the cap.
-    assert compute_backoff(40, rng) <= BACKOFF_CAP_SECONDS * (1 + 0.25)
+    assert compute_backoff(40, rng) <= BACKOFF_CAP_SECONDS * (1 + JITTER_RATIO)
 
 
 def test_backoff_never_returns_zero():
@@ -119,12 +122,3 @@ def test_error_text_is_truncated():
     row = FakeRow()
     pub._record_failure(row, ValueError("x" * 5000), DrainResult())
     assert len(row.last_error) <= 2000
-
-
-@pytest.mark.parametrize("attempts", [1, 2, 3, 8])
-def test_worst_case_retry_span_fits_inside_the_duplicate_window(attempts):
-    """Dedup only works if every retry lands inside the duplicate window."""
-    from favl_outbox.jetstream import DUPLICATE_WINDOW_SECONDS
-
-    worst_case = sum(BACKOFF_CAP_SECONDS for _ in range(8)) * 1.25
-    assert worst_case < DUPLICATE_WINDOW_SECONDS

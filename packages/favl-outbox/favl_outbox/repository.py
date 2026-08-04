@@ -5,6 +5,8 @@ from __future__ import annotations
 import uuid
 from typing import Any
 
+from .envelope import SCHEMA_VERSION
+
 
 def enqueue(
     session: Any,
@@ -14,6 +16,8 @@ def enqueue(
     payload: dict[str, Any],
     aggregate_type: str,
     aggregate_id: str | None = None,
+    aggregate_version: int = 1,
+    schema_version: int = SCHEMA_VERSION,
     max_attempts: int | None = None,
 ) -> Any:
     """Stage an event on the caller's session.
@@ -26,7 +30,9 @@ def enqueue(
         id=uuid.uuid4(),
         aggregate_type=aggregate_type,
         aggregate_id=aggregate_id,
+        aggregate_version=aggregate_version,
         subject=subject,
+        schema_version=schema_version,
         payload=payload,
     )
     if max_attempts is not None:

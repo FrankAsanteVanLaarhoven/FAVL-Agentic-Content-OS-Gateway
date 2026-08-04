@@ -1,0 +1,84 @@
+groups:
+  - name: outbox
+    rules:
+      # Backlog AGE is the primary signal, not backlog size. A large backlog
+      # that is draining is healthy; a single row stuck for a minute is not.
+      - alert: OutboxOldestPendingTooOld
+        expr: favl_outbox_oldest_pending_seconds > 60
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Outbox event unpublished for over 60s on {{ $labels.service }}"
+          description: "Oldest pending event is {{ $value | humanizeDuration }} old."
+
+      - alert: OutboxBacklogGrowing
+        expr: favl_outbox_pending > 100
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Outbox backlog above 100 rows on {{ $labels.service }}"
+
+      - alert: OutboxPublishFailureRatio
+        expr: |
+          sum by (service) (rate(favl_outbox_publish_total{result="failure"}[10m]))
+            /
+          clamp_min(sum by (service) (rate(favl_outbox_publish_total[10m])), 1e-9)
+            > 0.05
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Over 5% of outbox publishes failing on {{ $labels.service }}"
+
+      # Any dead letter is a correctness event: a committed domain change has
+      # no delivered event and never will without intervention.
+      - alert: OutboxDeadLetter
+        expr: favl_outbox_dead > 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Dead-lettered outbox events on {{ $labels.service }}"
+          description: "{{ $value }} event(s) will never be delivered without operator action."
+
+      - alert: OutboxStalledWhileWriting
+        expr: |
+          rate(favl_outbox_publish_total{result="success"}[5m]) == 0
+            and favl_outbox_pending > 0
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "No successful publication in 5m while a backlog exists on {{ $labels.service }}"
+
+      # Guards the deduplication proof at runtime, not only at startup.
+      - alert: OutboxDuplicateWindowMarginLow
+        expr: favl_outbox_duplicate_window_utilisation > 0.75
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Retry horizon exceeds 75% of the JetStream duplicate window"
+          description: "A retry could land outside the window and be delivered twice."
+
+  - name: availability
+    rules:
+      - alert: ServiceDown
+        expr: up{job=~"orchestrator|connector-registry|apisix|nats"} == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "{{ $labels.job }} has been unreachable for 2 minutes"
+
+      # Docker restart backoff and Kubernetes CrashLoopBackOff both present as
+      # a target that keeps disappearing rather than one that stays down.
+      - alert: ServiceFlapping
+        expr: changes(up{job=~"orchestrator|connector-registry"}[15m]) > 4
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $labels.job }} restarted repeatedly in 15 minutes"

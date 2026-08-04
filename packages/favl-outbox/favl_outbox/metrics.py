@@ -1,26 +1,51 @@
-"""Prometheus metrics for outbox visibility."""
+"""Prometheus metrics for outbox visibility.
+
+Naming note: `favl_outbox_pending` is a gauge, so it deliberately does not
+carry a `_total` suffix. Prometheus reserves `_total` for counters, and
+promtool lints a `_total` gauge as an error. Counters below keep the suffix.
+"""
 
 from __future__ import annotations
 
 from prometheus_client import Counter, Gauge, Histogram
 
-PUBLISHED = Counter(
-    "favl_outbox_published_total",
-    "Outbox events acknowledged by JetStream.",
+# --------------------------------------------------------------------- #
+# counters
+# --------------------------------------------------------------------- #
+
+PUBLISH = Counter(
+    "favl_outbox_publish_total",
+    "Outbox publish attempts by outcome.",
+    ["service", "subject", "result"],  # result: success | failure
+)
+
+RETRY = Counter(
+    "favl_outbox_retry_total",
+    "Outbox rows rescheduled for another attempt.",
     ["service", "subject"],
 )
 
-FAILURES = Counter(
-    "favl_outbox_publish_failures_total",
-    "Outbox publish attempts that failed.",
+DEAD_LETTER = Counter(
+    "favl_outbox_dead_letter_total",
+    "Outbox rows moved to dead after exhausting retries.",
     ["service", "subject"],
 )
 
-DEAD_LETTERED = Counter(
-    "favl_outbox_dead_lettered_total",
-    "Outbox events moved to dead after exhausting retries.",
-    ["service", "subject"],
+CLAIMED = Counter(
+    "favl_outbox_claimed_total",
+    "Outbox rows claimed by a publisher batch.",
+    ["service"],
 )
+
+CLAIM_TIMEOUT = Counter(
+    "favl_outbox_claim_timeout_total",
+    "Publisher batches that failed to claim rows, including lock timeouts.",
+    ["service"],
+)
+
+# --------------------------------------------------------------------- #
+# gauges
+# --------------------------------------------------------------------- #
 
 PENDING = Gauge(
     "favl_outbox_pending",
@@ -34,21 +59,32 @@ DEAD = Gauge(
     ["service"],
 )
 
-OLDEST_PENDING_AGE = Gauge(
-    "favl_outbox_oldest_pending_age_seconds",
-    "Age of the oldest unpublished outbox event.",
+OLDEST_PENDING = Gauge(
+    "favl_outbox_oldest_pending_seconds",
+    "Age of the oldest unpublished outbox event. The primary backlog alert.",
     ["service"],
 )
 
-PUBLISH_DURATION = Histogram(
-    "favl_outbox_publish_duration_seconds",
+WINDOW_UTILISATION = Gauge(
+    "favl_outbox_duplicate_window_utilisation",
+    "Worst-case retry horizon as a fraction of the JetStream duplicate "
+    "window. Above 1.0 a retry could escape deduplication.",
+    ["service"],
+)
+
+# --------------------------------------------------------------------- #
+# histograms
+# --------------------------------------------------------------------- #
+
+PUBLISH_LATENCY = Histogram(
+    "favl_outbox_publish_latency_seconds",
     "Time to publish a single outbox event and receive the ack.",
     ["service"],
     buckets=(0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0),
 )
 
-DRAIN_DURATION = Histogram(
-    "favl_outbox_drain_duration_seconds",
+DRAIN_LATENCY = Histogram(
+    "favl_outbox_drain_latency_seconds",
     "Time to process one publisher batch.",
     ["service"],
     buckets=(0.001, 0.01, 0.05, 0.1, 0.5, 1.0, 5.0),

@@ -15,10 +15,18 @@ logger = logging.getLogger(__name__)
 STREAM_NAME = "FAVL_EVENTS"
 SUBJECT_PREFIX = "favl"
 
-# Must exceed the worst-case retry span of the outbox publisher, otherwise a
-# late republish after a crash escapes deduplication. With max_attempts=8 and
-# a 300s backoff cap the worst case is well under 30 minutes.
-DUPLICATE_WINDOW_SECONDS = 2 * 3600
+# Must exceed the worst-case retry horizon of the outbox publisher, otherwise
+# a late republish after a crash escapes deduplication. The relationship is
+# not asserted here by eye — favl_outbox.timing computes the horizon from the
+# deployed retry policy and operational delays, and the publisher refuses to
+# start if it breaches the safety margin.
+DUPLICATE_WINDOW_SECONDS = float(
+    os.getenv("OUTBOX_DUPLICATE_WINDOW_SECONDS", str(2 * 3600))
+)
+
+# Upper bounds for the operational cost the retry loop itself cannot see.
+PUBLISH_TIMEOUT_SECONDS = float(os.getenv("OUTBOX_PUBLISH_TIMEOUT", "5"))
+CONNECT_TIMEOUT_SECONDS = float(os.getenv("OUTBOX_CONNECT_TIMEOUT", "5"))
 
 
 class JetStreamConnection:
@@ -40,7 +48,7 @@ class JetStreamConnection:
         try:
             self._nc = await nats.connect(
                 url,
-                connect_timeout=5,
+                connect_timeout=CONNECT_TIMEOUT_SECONDS,
                 max_reconnect_attempts=-1,
                 reconnect_time_wait=2,
             )
@@ -78,7 +86,11 @@ class JetStreamConnection:
         await self._js.update_stream(config)
 
     async def publish(
-        self, subject: str, body: bytes, msg_id: str, timeout: float = 5.0
+        self,
+        subject: str,
+        body: bytes,
+        msg_id: str,
+        timeout: float = PUBLISH_TIMEOUT_SECONDS,
     ) -> Any:
         """Publish with a deduplication id. Raises on failure."""
         if not self.ready:

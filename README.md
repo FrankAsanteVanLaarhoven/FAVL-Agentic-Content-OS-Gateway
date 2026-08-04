@@ -26,11 +26,12 @@ on a shared PostgreSQL instance, so no service can read another's tables.
   by a background worker with JetStream acks, retries, dead-lettering and
   deduplication
 - OpenTelemetry instrumentation hooks
-- Prometheus scraping of APISIX, NATS and the collector
+- Prometheus scraping of APISIX, NATS, the collector and both services,
+  with outbox alert rules
 - Kubernetes Gateway API examples
 - Docker Compose developer environment
 - Health/readiness endpoints reporting per-dependency state
-- Contract tests
+- Contract tests, run in a repository-local `.venv`
 - Secure configuration via environment variables
 
 ## Not yet implemented
@@ -70,6 +71,48 @@ poison event is visible in metrics rather than looping forever.
 
 `SKIP LOCKED` means multiple replicas can run the publisher concurrently
 without double-claiming a row.
+
+### The duplicate-window invariant is release-blocking
+
+Deduplication holds only while every retry lands inside the duplicate window.
+That is a property of deployed configuration, so it is checked at startup
+against the values the service actually runs with — not against constants
+copied into a test. A service whose configuration breaches it fails to boot:
+
+```text
+DuplicateWindowTooSmall: outbox retry horizon exceeds the safe share of the
+JetStream duplicate window: horizon=222389s window=7200s limit=5400s (75%).
+```
+
+The horizon counts more than the backoff curve. Each attempt also pays the
+database lock wait, broker connect timeout, publish timeout, poll interval
+and a process-restart budget — operational delay can push a row past the
+window even when the retry loop alone would not. Current utilisation is
+exported as `favl_outbox_duplicate_window_utilisation` and alerts above 0.75.
+
+### Consumers must still deduplicate
+
+The duplicate window is a safety net with an expiry, not a guarantee. A
+consumer can see an event twice when the window lapses, a stream is replayed
+or restored, an ack is lost, a subject is mirrored, or an operator
+republishes. Every event therefore carries:
+
+```json
+{
+  "event_id": "outbox-row-uuid",
+  "event_type": "agent.created",
+  "aggregate_type": "agent",
+  "aggregate_id": "...",
+  "aggregate_version": 1,
+  "occurred_at": "2026-08-04T05:47:12.859514+00:00",
+  "schema_version": 1,
+  "data": { }
+}
+```
+
+Deduplicate on `event_id` — it is stable across every republication and is
+the same value used as `Nats-Msg-Id`. Use `aggregate_version` to reject stale
+events and detect gaps; do not infer either from stream order.
 
 ## Repository layout
 
@@ -168,7 +211,7 @@ the development database, so do not point it at anything you care about.
 
 ## Observability
 
-Prometheus runs on `http://localhost:9092`. All three scrape targets should
+Prometheus runs on `http://localhost:9092`. All five scrape targets should
 report `up`:
 
 ```bash
@@ -180,6 +223,23 @@ NATS metrics come from `prometheus-nats-exporter` on port 7777. Prometheus
 cannot scrape the NATS `/varz` endpoint directly — it serves JSON, not the
 Prometheus text format. APISIX serves metrics at
 `/apisix/prometheus/metrics`, not `/metrics`.
+
+Alert rules live in `deploy/prometheus-alerts.yml`. The primary outbox signal
+is backlog *age*, not size: a large backlog that is draining is healthy,
+while one row stuck for a minute is not.
+
+## Health probes
+
+Two distinct contracts, because conflating them turns a dependency outage
+into a restart storm:
+
+| Endpoint | Checks | Use for |
+|---|---|---|
+| `/livez` | process event loop only | liveness probe |
+| `/readyz` | database, NATS, stream, outbox backlog | readiness probe, load-balancer gating |
+
+`/health/live` and `/health/ready` remain as aliases for the existing APISIX
+`/health/*` route.
 
 ## Production rules
 

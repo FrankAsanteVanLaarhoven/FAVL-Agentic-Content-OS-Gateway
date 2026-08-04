@@ -17,6 +17,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from .db import SessionLocal, engine, get_session
 from .models import AgentRecord
 from .outbox import OutboxEvent, connection, publisher, publisher_enabled
+from .outbox import WINDOW_UTILISATION
 from .schemas import Agent, AgentCreate, Invocation
 
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
@@ -27,6 +28,11 @@ __all__ = ["app", "Agent", "AgentCreate", "Invocation"]
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # The invariant is enforced at import, before logging is configured, so
+    # the result is restated here where it is actually visible.
+    logger.info(
+        "outbox.duplicate_window_utilisation=%.1f%%", WINDOW_UTILISATION * 100
+    )
     await connection.connect()
     if publisher_enabled():
         # Pending rows left by a previous process are picked up here; no
@@ -65,11 +71,20 @@ def _to_schema(record: AgentRecord) -> Agent:
     )
 
 
+@app.get("/livez")
 @app.get("/health/live")
 async def live() -> dict[str, str]:
+    """Liveness: is this process still running its event loop?
+
+    Deliberately checks no external dependency. A liveness probe that fails
+    when PostgreSQL or NATS is down turns a dependency outage into a
+    cluster-wide restart storm, which is strictly worse than a degraded but
+    running service. Dependency state belongs in /readyz.
+    """
     return {"status": "live"}
 
 
+@app.get("/readyz")
 @app.get("/health/ready")
 async def ready() -> dict[str, Any]:
     """Readiness reports each dependency plus outbox backlog separately."""
@@ -161,6 +176,7 @@ async def create_agent(
         payload=agent.model_dump(mode="json"),
         aggregate_type="agent",
         aggregate_id=str(record.id),
+        aggregate_version=record.version,
     )
     # One commit covers the agent and its event. A crash on either side of
     # this line leaves both present or both absent, never one alone.
@@ -189,6 +205,8 @@ async def delete_agent(
         payload={"agent_id": str(agent_id), "name": record.name},
         aggregate_type="agent",
         aggregate_id=str(agent_id),
+        # The row is going away; the delete is the next version of it.
+        aggregate_version=record.version + 1,
     )
     await session.commit()
 
@@ -247,6 +265,7 @@ async def invoke_agent(
         payload=result,
         aggregate_type="agent",
         aggregate_id=str(agent_id),
+        aggregate_version=record.version,
     )
     await session.commit()
     return result
