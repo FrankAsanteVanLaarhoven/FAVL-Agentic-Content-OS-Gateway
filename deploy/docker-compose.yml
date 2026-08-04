@@ -18,13 +18,16 @@ services:
       - otel-collector
 
   orchestrator:
-    build: ../services/orchestrator
+    build:
+      context: ..
+      dockerfile: services/orchestrator/Dockerfile
     restart: unless-stopped
     environment:
       NATS_URL: ${NATS_URL}
       CONNECTOR_REGISTRY_URL: ${CONNECTOR_REGISTRY_URL}
       OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT}
       DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/favl_orchestrator
+      OUTBOX_PUBLISHER_ENABLED: ${OUTBOX_PUBLISHER_ENABLED:-true}
     depends_on:
       nats:
         condition: service_started
@@ -34,11 +37,17 @@ services:
         condition: service_healthy
 
   connector-registry:
-    build: ../services/connector-registry
+    build:
+      context: ..
+      dockerfile: services/connector-registry/Dockerfile
     restart: unless-stopped
     environment:
       DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/favl_connectors
+      NATS_URL: ${NATS_URL}
+      OUTBOX_PUBLISHER_ENABLED: ${OUTBOX_PUBLISHER_ENABLED:-true}
     depends_on:
+      nats:
+        condition: service_started
       postgres:
         condition: service_healthy
 

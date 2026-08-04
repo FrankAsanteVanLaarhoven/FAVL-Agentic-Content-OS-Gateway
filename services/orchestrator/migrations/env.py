@@ -11,6 +11,7 @@ from sqlalchemy.pool import NullPool
 
 from app.db import Base
 from app.models import AgentRecord  # noqa: F401  (import registers the table)
+from app.outbox import OutboxEvent  # noqa: F401  (import registers the table)
 
 config = context.config
 

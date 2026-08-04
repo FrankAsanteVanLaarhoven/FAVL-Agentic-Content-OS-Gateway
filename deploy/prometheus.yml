@@ -12,3 +12,9 @@ scrape_configs:
   - job_name: nats
     static_configs:
       - targets: ["nats-exporter:7777"]
+  - job_name: orchestrator
+    static_configs:
+      - targets: ["orchestrator:8000"]
+  - job_name: connector-registry
+    static_configs:
+      - targets: ["connector-registry:8001"]

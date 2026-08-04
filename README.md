@@ -22,7 +22,9 @@ on a shared PostgreSQL instance, so no service can read another's tables.
 - Agent orchestration API, persisted in PostgreSQL
 - Connector registry API, persisted in PostgreSQL
 - Alembic migrations, applied on service start
-- NATS JetStream event publishing with server acks
+- Transactional outbox: domain row and event committed together, published
+  by a background worker with JetStream acks, retries, dead-lettering and
+  deduplication
 - OpenTelemetry instrumentation hooks
 - Prometheus scraping of APISIX, NATS and the collector
 - Kubernetes Gateway API examples
@@ -38,11 +40,36 @@ Named here so the gap is explicit rather than assumed:
 - Connector adapters. `POST /internal/connectors/{id}/invoke` validates the
   connector and echoes the request; it does not yet dispatch on `kind` or
   call `base_url`.
-- Transactional outbox. The database write and the JetStream publish are
-  separate operations, so a crash between them loses the event. Publish
-  failures are logged and surfaced via `/health/ready`, never swallowed.
 - Workflow engine, model router, policy engine, memory services, billing,
   developer portal, SDKs.
+
+## Delivery guarantee
+
+At-least-once, deduplicated at the stream. `packages/favl-outbox` stages an
+event on the same session as the domain row, so one commit covers both:
+
+```text
+API request ──▶ single DB transaction ──┬──▶ domain row
+                                        └──▶ outbox row
+                                                │
+                             outbox publisher ──┴──▶ JetStream ──▶ consumers
+```
+
+The publisher claims rows with `SELECT ... FOR UPDATE SKIP LOCKED` and
+publishes inside the claiming transaction. If the process dies after the
+broker acks but before the commit, the row returns to `pending` and is
+published again — carrying the same `Nats-Msg-Id` (the outbox row id), so
+JetStream collapses it inside a two-hour duplicate window. That is why the
+guarantee is at-least-once plus dedup rather than exactly-once: a database
+commit and a broker publish cannot be made atomic without a distributed
+transaction.
+
+Failures retry with jittered exponential backoff to a 300s cap. After
+`max_attempts` (default 8) a row becomes `dead` and stops retrying, so a
+poison event is visible in metrics rather than looping forever.
+
+`SKIP LOCKED` means multiple replicas can run the publisher concurrently
+without double-claiming a row.
 
 ## Repository layout
 
@@ -50,9 +77,11 @@ Named here so the gap is explicit rather than assumed:
 gateway/
   apisix.yaml
   config.yaml
+packages/
+  favl-outbox/           # transactional outbox library, shared by services
 services/
-  orchestrator/          # agents API, JetStream publisher, migrations
-  connector-registry/    # connectors API, migrations
+  orchestrator/          # agents API, outbox publisher, migrations
+  connector-registry/    # connectors API, outbox publisher, migrations
 deploy/
   docker-compose.yml
   postgres/
@@ -120,6 +149,22 @@ Published events are durable and replayable from the `FAVL_EVENTS` stream:
 ```bash
 curl -s "http://localhost:8222/jsz?streams=1"
 ```
+
+## Verifying the outbox
+
+`tests/verify_outbox.sh` exercises the delivery guarantee against the running
+stack. It disables the publisher to create a committed-but-unpublished
+backlog, restarts it, replays event ids to prove deduplication, takes the
+broker down mid-write, injects a poison event, and hard-kills the
+orchestrator four times during a 300-write load:
+
+```bash
+docker compose --env-file .env -f deploy/docker-compose.yml up -d --build
+bash tests/verify_outbox.sh
+```
+
+It takes several minutes and asserts 15 conditions. It writes test rows into
+the development database, so do not point it at anything you care about.
 
 ## Observability
 

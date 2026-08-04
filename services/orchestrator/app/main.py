@@ -7,14 +7,16 @@ from contextlib import asynccontextmanager
 from typing import Any
 
 import httpx
-from fastapi import Depends, FastAPI, HTTPException, Request, status
+from fastapi import Depends, FastAPI, HTTPException, Request, Response, status
+from favl_outbox import enqueue
+from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 from sqlalchemy import select, text
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from .db import SessionLocal, engine, get_session
-from .events import publisher
 from .models import AgentRecord
+from .outbox import OutboxEvent, connection, publisher, publisher_enabled
 from .schemas import Agent, AgentCreate, Invocation
 
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
@@ -25,15 +27,22 @@ __all__ = ["app", "Agent", "AgentCreate", "Invocation"]
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    await publisher.connect()
+    await connection.connect()
+    if publisher_enabled():
+        # Pending rows left by a previous process are picked up here; no
+        # separate recovery path is needed.
+        publisher.start()
+    else:
+        logger.warning("outbox.publisher_disabled service=orchestrator")
     yield
-    await publisher.close()
+    await publisher.stop()
+    await connection.close()
     await engine.dispose()
 
 
 app = FastAPI(
     title="FAVL Agent Orchestrator",
-    version="0.2.0",
+    version="0.3.0",
     lifespan=lifespan,
 )
 
@@ -63,8 +72,9 @@ async def live() -> dict[str, str]:
 
 @app.get("/health/ready")
 async def ready() -> dict[str, Any]:
-    """Readiness reflects both dependencies, not just the broker."""
+    """Readiness reports each dependency plus outbox backlog separately."""
     db_ok = True
+    outbox: dict[str, Any] = {}
     try:
         async with SessionLocal() as session:
             await session.execute(text("SELECT 1"))
@@ -72,15 +82,39 @@ async def ready() -> dict[str, Any]:
         db_ok = False
         logger.error("health.database_unreachable error=%s", exc)
 
-    nats_ok = publisher.connected and publisher.stream_ready
+    if db_ok:
+        try:
+            stats = await publisher.stats()
+            outbox = {
+                "pending": stats.pending,
+                "dead": stats.dead,
+                "published": stats.published,
+                "oldest_pending_age_seconds": stats.oldest_pending_age_seconds,
+                "publisher_running": publisher.running,
+            }
+        except SQLAlchemyError as exc:
+            logger.error("health.outbox_stats_failed error=%s", exc)
+
+    nats_ok = connection.ready
     body: dict[str, Any] = {
+        # A backlog does not make the service unready: writes are still
+        # accepted and durable. Only a dead dependency does.
         "status": "ready" if (db_ok and nats_ok) else "degraded",
         "database_connected": db_ok,
         "nats_connected": nats_ok,
+        "outbox": outbox,
     }
+    if connection.last_error:
+        body["nats_last_error"] = connection.last_error
     if publisher.last_error:
-        body["nats_last_error"] = publisher.last_error
+        body["outbox_last_error"] = publisher.last_error
     return body
+
+
+@app.get("/metrics")
+async def prometheus_metrics() -> Response:
+    """Internal only: not routed through APISIX."""
+    return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)
 
 
 @app.get("/v1/agents", response_model=list[Agent])
@@ -109,17 +143,28 @@ async def create_agent(
         connector_ids=payload.connector_ids,
     )
     session.add(record)
+    # Flush to obtain the generated id and surface a name collision before an
+    # outbox row is staged for an agent that will not exist.
     try:
-        await session.commit()
+        await session.flush()
     except IntegrityError:
         await session.rollback()
         raise HTTPException(
             status_code=409, detail=f"Agent named '{payload.name}' already exists"
         ) from None
-    await session.refresh(record)
 
     agent = _to_schema(record)
-    await publisher.publish("agent.created", agent.model_dump(mode="json"))
+    enqueue(
+        session,
+        OutboxEvent,
+        subject="agent.created",
+        payload=agent.model_dump(mode="json"),
+        aggregate_type="agent",
+        aggregate_id=str(record.id),
+    )
+    # One commit covers the agent and its event. A crash on either side of
+    # this line leaves both present or both absent, never one alone.
+    await session.commit()
     return agent
 
 
@@ -137,8 +182,15 @@ async def delete_agent(
     if record is None:
         raise HTTPException(status_code=404, detail="Agent not found")
     await session.delete(record)
+    enqueue(
+        session,
+        OutboxEvent,
+        subject="agent.deleted",
+        payload={"agent_id": str(agent_id), "name": record.name},
+        aggregate_type="agent",
+        aggregate_id=str(agent_id),
+    )
     await session.commit()
-    await publisher.publish("agent.deleted", {"agent_id": str(agent_id)})
 
 
 @app.post("/v1/agents/{agent_id}/invoke")
@@ -188,5 +240,13 @@ async def invoke_agent(
                 )
 
     result = {"agent_id": str(agent_id), "outputs": outputs}
-    await publisher.publish("agent.invoked", result)
+    enqueue(
+        session,
+        OutboxEvent,
+        subject="agent.invoked",
+        payload=result,
+        aggregate_type="agent",
+        aggregate_id=str(agent_id),
+    )
+    await session.commit()
     return result

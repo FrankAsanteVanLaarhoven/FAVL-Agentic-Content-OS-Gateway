@@ -1,0 +1,17 @@
+# The build context is the repository root; keep it small and secret-free.
+.git
+.github
+.env
+.env.*
+!.env.example
+**/__pycache__
+**/*.py[cod]
+**/.pytest_cache
+**/.mypy_cache
+**/.ruff_cache
+**/*.egg-info
+.venv
+venv
+deploy/kubernetes
+docs
+*.md
