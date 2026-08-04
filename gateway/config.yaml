@@ -14,6 +14,21 @@ deployment:
   role_data_plane:
     config_provider: yaml
 
+# Declaring this list REPLACES the APISIX default set, so every plugin any
+# route uses must appear here. `opentelemetry` is not enabled by default in
+# 3.x, and an unknown plugin invalidates the entire route at load time —
+# which silently dropped /v1/agents* and /v1/connectors* rather than failing
+# loudly.
+plugins:
+  - real-ip
+  - request-id
+  - cors
+  - openid-connect
+  - limit-count
+  - proxy-rewrite
+  - prometheus
+  - opentelemetry
+
 plugin_attr:
   prometheus:
     export_addr:

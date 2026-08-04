@@ -21,7 +21,7 @@ routes:
       openid-connect:
         client_id: "$env://KEYCLOAK_CLIENT_ID"
         client_secret: "$env://KEYCLOAK_CLIENT_SECRET"
-        discovery: "$env://KEYCLOAK_ISSUER/.well-known/openid-configuration"
+        discovery: "$env://KEYCLOAK_DISCOVERY"
         bearer_only: true
         realm: favl
         ssl_verify: false
@@ -61,7 +61,7 @@ routes:
       openid-connect:
         client_id: "$env://KEYCLOAK_CLIENT_ID"
         client_secret: "$env://KEYCLOAK_CLIENT_SECRET"
-        discovery: "$env://KEYCLOAK_ISSUER/.well-known/openid-configuration"
+        discovery: "$env://KEYCLOAK_DISCOVERY"
         bearer_only: true
         realm: favl
         ssl_verify: false

@@ -11,16 +11,28 @@
       "directAccessGrantsEnabled": true,
       "serviceAccountsEnabled": true,
       "standardFlowEnabled": true,
-      "redirectUris": ["http://localhost:*/*"],
-      "webOrigins": ["http://localhost:*"]
+      "redirectUris": [
+        "http://localhost:*/*"
+      ],
+      "webOrigins": [
+        "http://localhost:*"
+      ]
     }
   ],
   "roles": {
     "realm": [
-      {"name": "platform-admin"},
-      {"name": "agent-developer"},
-      {"name": "connector-operator"},
-      {"name": "viewer"}
+      {
+        "name": "platform-admin"
+      },
+      {
+        "name": "agent-developer"
+      },
+      {
+        "name": "connector-operator"
+      },
+      {
+        "name": "viewer"
+      }
     ]
   },
   "users": [
@@ -28,9 +40,20 @@
       "username": "demo",
       "enabled": true,
       "credentials": [
-        {"type": "password", "value": "demo-password", "temporary": false}
+        {
+          "type": "password",
+          "value": "demo-password",
+          "temporary": false
+        }
       ],
-      "realmRoles": ["agent-developer"]
+      "realmRoles": [
+        "agent-developer"
+      ],
+      "email": "demo@favl.local",
+      "emailVerified": true,
+      "firstName": "Demo",
+      "lastName": "User",
+      "requiredActions": []
     }
   ]
 }

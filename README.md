@@ -34,13 +34,54 @@ on a shared PostgreSQL instance, so no service can read another's tables.
 - Contract tests, run in a repository-local `.venv`
 - Secure configuration via environment variables
 
+## Connector runtime
+
+Three adapter kinds are registered: `internal`, `http`, `webhook`. Dispatch is
+registry-based and exhaustive — an unregistered kind is rejected at
+registration, and there is no echo fallback, because a silent no-op reporting
+success is the worst failure mode a connector runtime can have.
+
+Every invocation is a persisted state machine (`accepted` → `running` →
+terminal), not a request/response pair, so it survives the process for replay
+and audit. Idempotency is enforced by a unique constraint on
+`(tenant_id, connector_id, idempotency_key)`:
+
+| Prior invocation | Repeat behaviour |
+|---|---|
+| succeeded | stored result returned, `200`, provider not called again |
+| still running | `202` with the existing invocation id |
+| failed terminally | stored terminal result returned |
+| failed retryably | retried only per the explicit retry policy |
+
+`idempotency_mode` on each connector states what the gateway can actually
+promise — `provider_key`, `read_only`, `gateway_dedup_only` or `unsupported`.
+`gateway_dedup_only` cannot guarantee exactly-once side effects if the process
+dies after the provider accepts but before the local result commits.
+
+### Outbound security
+
+The HTTP adapter is an SSRF primitive without controls, so every outbound
+request is guarded: allowlisted host, HTTPS by default, resolution of the
+hostname with **every** returned address validated, and the connection pinned
+to a validated address so a second lookup cannot rebind it. Loopback,
+link-local, multicast and cloud metadata endpoints stay blocked even when a
+connector explicitly permits private addresses — `allow_private_addresses`
+means the internal network, not the service's own admin surface. Redirects
+are followed manually and revalidated per hop; responses are size- and
+content-type-capped; inbound `Authorization`, `Cookie` and `X-API-Key` are
+never forwarded.
+
+Secrets are referenced (`env:NAME`), resolved at the moment of use, and never
+returned through the API, written to an event, or logged.
+
 ## Not yet implemented
 
 Named here so the gap is explicit rather than assumed:
 
-- Connector adapters. `POST /internal/connectors/{id}/invoke` validates the
-  connector and echoes the request; it does not yet dispatch on `kind` or
-  call `base_url`.
+- MCP and A2A adapters, OAuth-heavy SaaS connectors, plugin execution.
+- Hard deletion. `DELETE` performs a soft transition to
+  `deletion_requested`; physical removal is a later privileged operation with
+  its own preconditions.
 - Workflow engine, model router, policy engine, memory services, billing,
   developer portal, SDKs.
 

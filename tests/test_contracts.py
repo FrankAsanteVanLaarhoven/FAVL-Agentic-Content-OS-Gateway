@@ -63,7 +63,28 @@ def test_connector_contract_accepts_known_kinds():
     for kind in ("http", "mcp", "webhook", "internal"):
         model = ConnectorCreate(name=f"conn-{kind}", kind=kind)
         assert model.kind == kind
-        assert model.enabled is True
+        # `enabled` was replaced by an authoritative status enum in M1.3;
+        # two sources of truth for "may this run" eventually disagree.
+        assert model.status.value == "enabled"
+
+
+def test_connector_cannot_be_created_in_a_deletion_state():
+    for bad in ("deletion_requested", "deleted"):
+        with pytest.raises(ValidationError):
+            ConnectorCreate(name="c", kind="http", status=bad)
+
+
+def test_connector_config_rejects_literal_secrets():
+    for key in ("signing_secret", "api_key", "password", "token", "client_secret"):
+        with pytest.raises(ValidationError):
+            ConnectorCreate(name="c", kind="http", config={key: "hunter2"})
+
+
+def test_connector_config_accepts_secret_references():
+    model = ConnectorCreate(
+        name="wh", kind="webhook", config={"signing_secret_ref": "env:WEBHOOK_KEY"}
+    )
+    assert model.config["signing_secret_ref"] == "env:WEBHOOK_KEY"
 
 
 def test_connector_rejects_a_non_url_base_url():

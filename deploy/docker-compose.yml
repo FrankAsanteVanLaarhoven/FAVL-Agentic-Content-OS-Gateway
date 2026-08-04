@@ -7,6 +7,7 @@ services:
       - ../gateway/apisix.yaml:/usr/local/apisix/conf/apisix.yaml:ro
     environment:
       KEYCLOAK_ISSUER: ${KEYCLOAK_ISSUER}
+      KEYCLOAK_DISCOVERY: ${KEYCLOAK_DISCOVERY}
       KEYCLOAK_CLIENT_ID: ${KEYCLOAK_CLIENT_ID}
       KEYCLOAK_CLIENT_SECRET: ${KEYCLOAK_CLIENT_SECRET}
     ports:
@@ -45,11 +46,29 @@ services:
       DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/favl_connectors
       NATS_URL: ${NATS_URL}
       OUTBOX_PUBLISHER_ENABLED: ${OUTBOX_PUBLISHER_ENABLED:-true}
+      # Operator-controlled service registry for the internal adapter.
+      # Connectors address these by name; they cannot supply a URL.
+      INTERNAL_SERVICE_REGISTRY: ${INTERNAL_SERVICE_REGISTRY:-}
+      # Development signing key for the webhook adapter. M1.7 replaces the
+      # env-backed resolver with a real secret manager.
+      WEBHOOK_SIGNING_KEY: ${WEBHOOK_SIGNING_KEY:-dev-signing-key}
     depends_on:
       nats:
         condition: service_started
       postgres:
         condition: service_healthy
+
+  # Development only: never started unless the `dev` profile is requested.
+  testprovider:
+    profiles: ["dev"]
+    image: python:3.11-slim
+    restart: unless-stopped
+    command: ["python", "/app/provider.py"]
+    environment:
+      PORT: "9099"
+      WEBHOOK_SIGNING_KEY: ${WEBHOOK_SIGNING_KEY:-dev-signing-key}
+    volumes:
+      - ./testprovider/provider.py:/app/provider.py:ro
 
   postgres:
     image: postgres:17-alpine
