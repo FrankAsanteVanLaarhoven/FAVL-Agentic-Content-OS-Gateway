@@ -1,0 +1,99 @@
+routes:
+  - id: orchestrator-agents
+    name: orchestrator-agents
+    uri: /v1/agents*
+    methods: [GET, POST, PUT, DELETE, OPTIONS]
+    upstream:
+      type: roundrobin
+      nodes:
+        "orchestrator:8000": 1
+    plugins:
+      request-id:
+        header_name: X-Request-ID
+        include_in_response: true
+      cors:
+        allow_origins: "https://app.example.com"
+        allow_methods: "GET,POST,PUT,DELETE,OPTIONS"
+        allow_headers: "Authorization,Content-Type,X-Request-ID"
+        expose_headers: "X-Request-ID"
+        allow_credential: true
+        max_age: 3600
+      openid-connect:
+        client_id: "$env://KEYCLOAK_CLIENT_ID"
+        client_secret: "$env://KEYCLOAK_CLIENT_SECRET"
+        discovery: "$env://KEYCLOAK_ISSUER/.well-known/openid-configuration"
+        bearer_only: true
+        realm: favl
+        ssl_verify: false
+      limit-count:
+        count: 300
+        time_window: 60
+        rejected_code: 429
+        key_type: var
+        key: remote_addr
+        policy: local
+      proxy-rewrite:
+        headers:
+          set:
+            X-Gateway: favl-apisix
+      prometheus: {}
+      opentelemetry:
+        sampler:
+          name: parent_base
+          options:
+            base_sampler:
+              name: trace_id_ratio
+              options:
+                fraction: 0.25
+
+  - id: connector-registry
+    name: connector-registry
+    uri: /v1/connectors*
+    methods: [GET, POST, PUT, DELETE, OPTIONS]
+    upstream:
+      type: roundrobin
+      nodes:
+        "connector-registry:8001": 1
+    plugins:
+      request-id:
+        header_name: X-Request-ID
+        include_in_response: true
+      openid-connect:
+        client_id: "$env://KEYCLOAK_CLIENT_ID"
+        client_secret: "$env://KEYCLOAK_CLIENT_SECRET"
+        discovery: "$env://KEYCLOAK_ISSUER/.well-known/openid-configuration"
+        bearer_only: true
+        realm: favl
+        ssl_verify: false
+      limit-count:
+        count: 120
+        time_window: 60
+        rejected_code: 429
+        key_type: var
+        key: remote_addr
+        policy: local
+      prometheus: {}
+      opentelemetry:
+        sampler:
+          name: always_on
+
+  - id: public-health
+    name: public-health
+    uri: /health/*
+    methods: [GET]
+    upstream:
+      type: roundrobin
+      nodes:
+        "orchestrator:8000": 1
+    plugins:
+      proxy-rewrite:
+        regex_uri: ["^/health/(.*)", "/health/$1"]
+      limit-count:
+        count: 60
+        time_window: 60
+        rejected_code: 429
+        key_type: var
+        key: remote_addr
+        policy: local
+
+#END

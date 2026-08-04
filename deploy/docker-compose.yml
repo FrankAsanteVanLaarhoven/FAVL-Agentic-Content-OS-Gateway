@@ -1,0 +1,122 @@
+services:
+  apisix:
+    image: apache/apisix:3.17.0-debian
+    restart: unless-stopped
+    volumes:
+      - ../gateway/config.yaml:/usr/local/apisix/conf/config.yaml:ro
+      - ../gateway/apisix.yaml:/usr/local/apisix/conf/apisix.yaml:ro
+    environment:
+      KEYCLOAK_ISSUER: ${KEYCLOAK_ISSUER}
+      KEYCLOAK_CLIENT_ID: ${KEYCLOAK_CLIENT_ID}
+      KEYCLOAK_CLIENT_SECRET: ${KEYCLOAK_CLIENT_SECRET}
+    ports:
+      - "9080:9080"
+      - "9091:9091"
+    depends_on:
+      - orchestrator
+      - connector-registry
+      - otel-collector
+
+  orchestrator:
+    build: ../services/orchestrator
+    restart: unless-stopped
+    environment:
+      NATS_URL: ${NATS_URL}
+      CONNECTOR_REGISTRY_URL: ${CONNECTOR_REGISTRY_URL}
+      OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT}
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/favl_orchestrator
+    depends_on:
+      nats:
+        condition: service_started
+      connector-registry:
+        condition: service_started
+      postgres:
+        condition: service_healthy
+
+  connector-registry:
+    build: ../services/connector-registry
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/favl_connectors
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  postgres:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./postgres/init-databases.sh:/docker-entrypoint-initdb.d/init-databases.sh:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+    ports:
+      # Loopback only: services reach Postgres over the compose network.
+      # This mapping exists for local psql/inspection, not for the LAN.
+      # 5432-5434 and 5532 are taken by other FAVL stacks on this host.
+      - "127.0.0.1:5435:5432"
+
+  nats:
+    image: nats:2.11-alpine
+    command: ["-js", "-m", "8222", "--store_dir", "/data"]
+    restart: unless-stopped
+    volumes:
+      - nats-data:/data
+    ports:
+      - "4222:4222"
+      - "8222:8222"
+
+  nats-exporter:
+    image: natsio/prometheus-nats-exporter:latest
+    restart: unless-stopped
+    command:
+      - "-varz"
+      - "-connz"
+      - "-routez"
+      - "-subz"
+      - "-jsz=all"
+      - "http://nats:8222"
+    depends_on:
+      - nats
+    ports:
+      - "7777:7777"
+
+  keycloak:
+    image: quay.io/keycloak/keycloak:26.3
+    command: ["start-dev", "--import-realm"]
+    restart: unless-stopped
+    environment:
+      KC_BOOTSTRAP_ADMIN_USERNAME: ${KEYCLOAK_ADMIN}
+      KC_BOOTSTRAP_ADMIN_PASSWORD: ${KEYCLOAK_ADMIN_PASSWORD}
+    volumes:
+      - ./keycloak/favl-realm.json:/opt/keycloak/data/import/favl-realm.json:ro
+    ports:
+      - "8080:8080"
+
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.131.1
+    command: ["--config=/etc/otelcol-contrib/config.yaml"]
+    volumes:
+      - ./otel-collector.yaml:/etc/otelcol-contrib/config.yaml:ro
+    ports:
+      - "4317:4317"
+      - "4318:4318"
+
+  prometheus:
+    image: prom/prometheus:v3.5.0
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    ports:
+      - "9092:9090"
+
+volumes:
+  nats-data:
+  postgres-data:

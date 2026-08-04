@@ -1,0 +1,27 @@
+apisix:
+  node_listen: 9080
+  enable_admin: false
+  enable_admin_cors: false
+  enable_control: true
+  control:
+    ip: "0.0.0.0"
+    port: 9090
+  router:
+    http: radixtree_host_uri
+
+deployment:
+  role: data_plane
+  role_data_plane:
+    config_provider: yaml
+
+plugin_attr:
+  prometheus:
+    export_addr:
+      ip: "0.0.0.0"
+      port: 9091
+  opentelemetry:
+    resource:
+      service.name: favl-apisix-gateway
+    collector:
+      address: otel-collector:4318
+      request_timeout: 3

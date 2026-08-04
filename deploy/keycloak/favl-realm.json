@@ -1,0 +1,36 @@
+{
+  "realm": "favl",
+  "enabled": true,
+  "registrationAllowed": false,
+  "clients": [
+    {
+      "clientId": "agentic-content-os",
+      "enabled": true,
+      "publicClient": false,
+      "secret": "replace-me",
+      "directAccessGrantsEnabled": true,
+      "serviceAccountsEnabled": true,
+      "standardFlowEnabled": true,
+      "redirectUris": ["http://localhost:*/*"],
+      "webOrigins": ["http://localhost:*"]
+    }
+  ],
+  "roles": {
+    "realm": [
+      {"name": "platform-admin"},
+      {"name": "agent-developer"},
+      {"name": "connector-operator"},
+      {"name": "viewer"}
+    ]
+  },
+  "users": [
+    {
+      "username": "demo",
+      "enabled": true,
+      "credentials": [
+        {"type": "password", "value": "demo-password", "temporary": false}
+      ],
+      "realmRoles": ["agent-developer"]
+    }
+  ]
+}
