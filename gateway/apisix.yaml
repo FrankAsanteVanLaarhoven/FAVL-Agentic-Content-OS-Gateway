@@ -154,6 +154,28 @@ routes:
               options:
                 fraction: 0.05
 
+  - id: public-health-registry
+    name: public-health-registry
+    # The connector registry had no public health route: only the
+    # orchestrator's was reachable, so an external probe could not tell the
+    # two apart. Body is booleans only — see app/main.py public_ready.
+    uri: /health/registry/*
+    methods: [GET]
+    upstream:
+      type: roundrobin
+      nodes:
+        "connector-registry:8001": 1
+    plugins:
+      proxy-rewrite:
+        regex_uri: ["^/health/registry/(.*)", "/health/$1"]
+      limit-count:
+        count: 60
+        time_window: 60
+        rejected_code: 429
+        key_type: var
+        key: remote_addr
+        policy: local
+
   - id: public-health
     name: public-health
     uri: /health/*
@@ -163,8 +185,6 @@ routes:
       nodes:
         "orchestrator:8000": 1
     plugins:
-      proxy-rewrite:
-        regex_uri: ["^/health/(.*)", "/health/$1"]
       limit-count:
         count: 60
         time_window: 60

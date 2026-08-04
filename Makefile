@@ -1,4 +1,4 @@
-.PHONY: test test-outbox venv up down validate clean-venv
+.PHONY: test test-outbox test-identity venv up down validate clean-venv
 
 COMPOSE = docker compose --env-file .env -f deploy/docker-compose.yml
 VENV    = .venv
@@ -60,3 +60,8 @@ typecheck: venv
 
 # Everything CI runs, in the order CI runs it.
 check: lint typecheck test
+
+test-identity:
+	bash tests/verify_identity.sh
+
+.PHONY: test-identity

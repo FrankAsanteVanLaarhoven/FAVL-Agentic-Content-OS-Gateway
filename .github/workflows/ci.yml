@@ -97,6 +97,18 @@ jobs:
       - name: Alert rules must reference metrics the code actually emits
         run: python3 scripts/check_alert_metrics.py
 
+      - name: Container images must be pinned by digest
+        run: python3 scripts/check_image_pins.py
+
+      - name: Kubernetes manifests must parse
+        run: |
+          python3 -c "
+          import sys, pathlib, yaml
+          for f in sorted(pathlib.Path('deploy/kubernetes').glob('*.yaml')):
+              docs = [d for d in yaml.safe_load_all(f.read_text()) if d]
+              print(f'{f}: {len(docs)} manifests')
+          "
+
   images:
     name: Images — build and scan
     runs-on: ubuntu-24.04
@@ -166,7 +178,7 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
   integration:
-    name: Integration — outbox delivery guarantee
+    name: Integration — delivery guarantee and tenant isolation
     runs-on: ubuntu-24.04
     # The suite kills containers under load and asserts on recovery; it is
     # slow by design, so it does not gate every push.
@@ -177,9 +189,14 @@ jobs:
       - name: Start the stack
         run: |
           cp .env.example .env
-          sed -i "s/^POSTGRES_PASSWORD=.*/POSTGRES_PASSWORD=$(openssl rand -hex 24)/" .env
+          # Real secrets for the run; .env.example ships placeholders only.
+          sed -i "s|^POSTGRES_PASSWORD=.*|POSTGRES_PASSWORD=$(openssl rand -hex 24)|" .env
+          sed -i "s|^INTERNAL_SERVICE_TOKEN=.*|INTERNAL_SERVICE_TOKEN=$(openssl rand -hex 32)|" .env
           docker compose --env-file .env -f deploy/docker-compose.yml --profile dev up -d --build
           timeout 180 bash -c 'until curl -sf http://localhost:9080/health/ready >/dev/null; do sleep 3; done'
+
+      - name: Verify identity and tenant isolation
+        run: bash tests/verify_identity.sh
 
       - name: Verify the transactional outbox
         run: bash tests/verify_outbox.sh

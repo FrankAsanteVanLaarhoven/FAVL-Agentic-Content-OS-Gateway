@@ -1,0 +1,47 @@
+# Local mirror of the CI gate. Everything here also runs in CI: a hook that
+# CI does not enforce is a suggestion, and a CI check with no local hook is a
+# slow feedback loop. Install with: pre-commit install
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      - id: check-added-large-files
+        args: ["--maxkb=512"]
+      - id: check-merge-conflict
+      - id: check-yaml
+        # Compose and the Kubernetes manifests use multi-document YAML.
+        args: ["--allow-multiple-documents"]
+        exclude: ^deploy/kubernetes/gateway\.yaml$
+      - id: check-json
+      - id: check-toml
+      - id: end-of-file-fixer
+      - id: trailing-whitespace
+      - id: detect-private-key
+      - id: mixed-line-ending
+        args: ["--fix=lf"]
+
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.13.1
+    hooks:
+      - id: ruff
+        args: ["--fix"]
+      - id: ruff-format
+
+  - repo: local
+    hooks:
+      # Runs against the whole repo rather than staged files: the check is
+      # cross-file by nature, comparing rule expressions to metric
+      # declarations in Python sources.
+      - id: alert-metrics
+        name: alert rules reference emitted metrics
+        entry: python3 scripts/check_alert_metrics.py
+        language: system
+        pass_filenames: false
+        files: ^(deploy/prometheus-alerts\.yml|.*metrics\.py|.*invocations\.py)$
+
+      - id: no-floating-image-tags
+        name: container images are pinned by digest
+        entry: python3 scripts/check_image_pins.py
+        language: system
+        pass_filenames: false
+        files: ^(deploy/docker-compose\.yml|.*Dockerfile)$

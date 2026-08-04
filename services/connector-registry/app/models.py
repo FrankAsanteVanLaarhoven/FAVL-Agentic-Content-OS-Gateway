@@ -8,6 +8,7 @@ from enum import Enum
 from typing import Any
 
 from sqlalchemy import (
+    Boolean,
     CheckConstraint,
     DateTime,
     ForeignKey,
@@ -16,6 +17,7 @@ from sqlalchemy import (
     String,
     Text,
     UniqueConstraint,
+    false,
     func,
 )
 from sqlalchemy.dialects.postgresql import ARRAY, JSONB, UUID
@@ -82,6 +84,17 @@ class ConnectorRecord(Base):
     )
     version: Mapped[int] = mapped_column(
         Integer, nullable=False, default=1, server_default="1"
+    )
+    # Derived from the adapter at create/validate time and stored, so a read
+    # reports the same guarantee the connector was created with.
+    supports_idempotency: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=false()
+    )
+    idempotency_mode: Mapped[str] = mapped_column(
+        String(32),
+        nullable=False,
+        default="unsupported",
+        server_default="unsupported",
     )
     deletion_requested_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True

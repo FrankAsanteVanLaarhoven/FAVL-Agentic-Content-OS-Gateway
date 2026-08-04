@@ -47,7 +47,7 @@ logger = logging.getLogger(__name__)
 __all__ = ["Connector", "ConnectorCreate", "app"]
 
 ADAPTERS = build_registry()
-EXPECTED_MIGRATION = os.getenv("EXPECTED_MIGRATION", "0005")
+EXPECTED_MIGRATION = os.getenv("EXPECTED_MIGRATION", "0006")
 
 # /internal/* bypasses APISIX, so it carries no OIDC token. It is protected
 # by a shared service credential compared in constant time, in addition to
@@ -119,6 +119,8 @@ def _to_schema(record: ConnectorRecord) -> Connector:
             "created_at": record.created_at,
             "deletion_requested_at": record.deletion_requested_at,
             "deleted_at": record.deleted_at,
+            "supports_idempotency": record.supports_idempotency,
+            "idempotency_mode": record.idempotency_mode,
         }
     )
 
@@ -330,6 +332,8 @@ async def create_connector(
         scopes=payload.scopes,
         config=config,
         status=payload.status.value,
+        supports_idempotency=report.supports_idempotency,
+        idempotency_mode=report.idempotency_mode.value,
     )
     session.add(record)
     try:
@@ -341,8 +345,6 @@ async def create_connector(
         ) from None
 
     connector = _to_schema(record)
-    connector.supports_idempotency = report.supports_idempotency
-    connector.idempotency_mode = report.idempotency_mode.value
     enqueue(
         session,
         OutboxEvent,
