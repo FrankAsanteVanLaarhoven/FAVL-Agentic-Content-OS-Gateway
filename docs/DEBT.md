@@ -115,10 +115,21 @@ in `make check` and fails when any of their activation triggers appears in the
 source without the corresponding control. Each has been observed both firing
 and clearing.
 
-None may be closed because the control exists. Each names the
-failure-injection test that must be observed failing first — an obligation
-closed on the strength of code being present is the same mistake in a new
-place.
+None may be closed because the control exists. The only permitted lifecycle:
+
+```
+capability appears
+→ tripwire fails
+→ control is implemented
+→ targeted failure is injected
+→ regression test observes the failure
+→ obligation may close
+```
+
+A regex match alone must never close an obligation. The script can report that
+a control is present; only an injected failure reports that it works — and an
+obligation closed on the strength of code being present is the same mistake in
+a new place.
 
 ## REV-001 — "Cancel queued invocations" is vacuous until execution is async
 
@@ -134,6 +145,21 @@ clause is not satisfied — there is nothing for it to be satisfied *by*.
 This is the dangerous kind of debt: the requirement reads as met because
 nothing violates it, and it becomes load-bearing at precisely the moment
 someone is busy building a worker pool.
+
+**Carries the connector half of the authority reconciliation.** ADR 0002 pins
+*connector* authority at acceptance; `docs/M1.5-PLAN.md` requires *credential*
+authority to be revalidated at every resolution. Synchronously the two are
+indistinguishable, because `accepted_at ≈ execution_started_at`. The dequeue
+checkpoint is where they separate, and where the rule must be stated:
+
+```
+accepted under connector v4 → connector later standard-revoked
+                            → queued work cancelled here
+```
+
+Do not let async dispatch inherit acceptance-time credential authority by
+default. That would decide the reconciliation accidentally, which is the
+specific failure this item exists to prevent.
 
 **Done when:** either an asynchronous path exists and cancels `ACCEPTED`
 invocations on revocation, with a live test that revokes between accept and
@@ -153,9 +179,26 @@ caller retrying issues a new invocation that passes through
 control — add an internal retry loop and the sentence becomes false with no
 test going red.
 
-**Done when:** any retry implementation re-checks revocation before resolving
-secrets, and a mutation removing that check kills a named test. Until then,
-this item is the tripwire.
+**Carries the credential half of the authority reconciliation.** A retry is
+the clearest case of an execution that must re-earn authority rather than
+inherit it:
+
+```
+accepted under credential v7 → credential v7 revoked before the retry
+                             → the retry must not resolve or use v7
+```
+
+`reauthorise_attempt()` must re-evaluate connector status, tenant ownership,
+credential version, revocation timestamp, authority snapshot and deadline —
+all six. Re-checking only the connector would leave a revoked *credential*
+usable, which is I13a, and is the more likely omission because the connector
+check already exists to be copied.
+
+**Done when:** any retry implementation re-authorises before resolving
+secrets, and a mutation removing that check kills a named test. The M1.5
+mutation target "reuse prior credential on retry" is that test; write it early
+as a skipped case with its reason rather than remembering it later. Until
+then, this item is the tripwire.
 
 ## REV-003 — The redirect loop has no revocation checkpoint
 

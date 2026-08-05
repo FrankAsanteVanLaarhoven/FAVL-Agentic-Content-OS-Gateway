@@ -20,6 +20,18 @@ corresponding control appears with it.
     python3 scripts/check_dormant_obligations.py
     python3 scripts/check_dormant_obligations.py --explain REV-002
 
+The only lifecycle by which an obligation may close:
+
+    capability appears
+    -> tripwire fails
+    -> control is implemented
+    -> targeted failure is injected
+    -> regression test observes the failure
+    -> obligation may close
+
+A regex match alone must NEVER close an obligation. This script can tell you
+the control is present; only an injected failure tells you it works.
+
 What this is NOT: proof. These are source-pattern heuristics, and a
 sufficiently creative implementation will evade them. They are a tripwire —
 something that makes a dormant obligation impossible to walk past silently,
