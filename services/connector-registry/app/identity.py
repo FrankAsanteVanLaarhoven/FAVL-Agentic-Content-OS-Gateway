@@ -29,6 +29,9 @@ from fastapi import Header, HTTPException
 
 logger = logging.getLogger(__name__)
 
+# No default tenant. A fallback here makes every caller share one tenant, so
+# `WHERE tenant_id = ...` matches every row and the isolation is vacuous while
+# appearing to work. A token without the claim is an unusable token.
 DEFAULT_TENANT = os.getenv("DEFAULT_TENANT_ID", "default")
 # Claim carrying the tenant. Keycloak deployments commonly map an
 # organisation or group claim here.
@@ -69,7 +72,14 @@ def identity_from_userinfo(raw: str | None) -> CallerIdentity | None:
     subject = claims.get("sub") or claims.get("preferred_username")
     if not subject:
         return None
-    tenant = claims.get(TENANT_CLAIM) or DEFAULT_TENANT
+    tenant = claims.get(TENANT_CLAIM)
+    if not tenant:
+        # Fail closed. Falling back to a shared default would silently
+        # collapse every tenant into one.
+        logger.error(
+            "identity.missing_tenant_claim claim=%s subject=%s", TENANT_CLAIM, subject
+        )
+        return None
     return CallerIdentity(actor_id=str(subject), tenant_id=str(tenant), verified=True)
 
 
@@ -82,8 +92,9 @@ async def current_identity(
         return identity
 
     if ALLOW_ANONYMOUS:
-        # Development and the internal service path only; never a deployment
-        # that is reachable by an untrusted client.
+        # Development only, and never a deployment reachable by an untrusted
+        # client. Guarded so it cannot be enabled by accident in production.
+        logger.warning("identity.anonymous_fallback_used tenant=%s", DEFAULT_TENANT)
         return CallerIdentity(
             actor_id="anonymous", tenant_id=DEFAULT_TENANT, verified=False
         )

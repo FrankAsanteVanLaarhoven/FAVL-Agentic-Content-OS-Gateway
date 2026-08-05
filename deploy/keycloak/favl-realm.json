@@ -16,6 +16,22 @@
       ],
       "webOrigins": [
         "http://localhost:*"
+      ],
+      "protocolMappers": [
+        {
+          "name": "tenant",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-usermodel-attribute-mapper",
+          "consentRequired": false,
+          "config": {
+            "user.attribute": "tenant",
+            "claim.name": "tenant",
+            "jsonType.label": "String",
+            "id.token.claim": "true",
+            "access.token.claim": "true",
+            "userinfo.token.claim": "true"
+          }
+        }
       ]
     }
   ],
@@ -53,7 +69,12 @@
       "emailVerified": true,
       "firstName": "Demo",
       "lastName": "User",
-      "requiredActions": []
+      "requiredActions": [],
+      "attributes": {
+        "tenant": [
+          "favl-demo"
+        ]
+      }
     }
   ]
 }

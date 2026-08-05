@@ -17,6 +17,21 @@ psql_orch() { $DC exec -T postgres psql -U favl -d favl_orchestrator -tAc "$1" |
 js_count() { curl -fsS "http://localhost:8222/jsz?streams=1" | python3 -c "import json,sys; print(json.load(sys.stdin)['messages'])"; }
 drain() { sleep "${1:-20}"; }
 
+# A driver that dies part-way used to leave later checks comparing an empty
+# string, which reads as a confusing assertion failure rather than "the test
+# harness broke". This makes a missing key an explicit, named failure.
+expect_key() { # expect_key <stdout> <key>
+  local value
+  value=$(echo "$1" | grep "^$2=" | head -1 | cut -d= -f2- | tr -d ' \r')
+  if [ -z "$value" ]; then
+    printf '  ERROR %-56s driver produced no %s — it exited early\n' "harness" "$2"
+    FAIL=$((FAIL + 1))
+    echo "__MISSING__"
+    return
+  fi
+  echo "$value"
+}
+
 check() { # check <label> <actual> <expected>
   if [ "$2" = "$3" ]; then
     printf '  PASS  %-52s %s\n' "$1" "$2"; PASS=$((PASS + 1))

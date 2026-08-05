@@ -12,6 +12,21 @@ DC="docker compose --env-file .env -f deploy/docker-compose.yml"
 PASS=0
 FAIL=0
 
+# A driver that dies part-way used to leave later checks comparing an empty
+# string, which reads as a confusing assertion failure rather than "the test
+# harness broke". This makes a missing key an explicit, named failure.
+expect_key() { # expect_key <stdout> <key>
+  local value
+  value=$(echo "$1" | grep "^$2=" | head -1 | cut -d= -f2- | tr -d ' \r')
+  if [ -z "$value" ]; then
+    printf '  ERROR harness: driver produced no %s — it exited early\n' "$2" >&2
+    FAIL=$((FAIL + 1))
+    echo "__DRIVER_DIED__"
+    return
+  fi
+  echo "$value"
+}
+
 check() {
   if [ "$2" = "$3" ]; then
     printf '  PASS  %-56s %s\n' "$1" "$2"; PASS=$((PASS + 1))
@@ -70,9 +85,7 @@ async def main() -> None:
         # With a real token, the caller sees only their own tenant.
         r = await c.get(f"{GW}/v1/invocations?limit=50", headers=auth)
         rows = r.json() if r.status_code == 200 else []
-        tenants = sorted({row["tenant_id"] for row in rows})
         print(f"authenticated_status={r.status_code}")
-        print(f"distinct_tenants={len(tenants)}")
 
         # Connectors are tenant-scoped too. A connector planted in another
         # tenant must be invisible and un-invokable, and must 404 rather than
@@ -85,9 +98,49 @@ async def main() -> None:
 
         r = await c.get(f"{GW}/v1/connectors", headers=auth)
         conns = r.json() if r.status_code == 200 else []
-        conn_tenants = sorted({c_.get("tenant_id", "unset") for c_ in conns})
         print(f"connector_list_status={r.status_code}")
-        print(f"connector_count={len(conns)}")
+
+        # The caller's tenant must come from the token's claim, not a shared
+        # default. If the realm stops emitting it, identity fails closed and
+        # this whole block returns 401 rather than silently collapsing every
+        # tenant into one.
+        import base64 as _b64
+        import json as _json
+
+        part = token.split(".")[1]
+        part += "=" * (-len(part) % 4)
+        claims = _json.loads(_b64.urlsafe_b64decode(part))
+        my_tenant = claims.get("tenant", "ABSENT")
+        print(f"token_tenant={my_tenant}")
+
+        # Nothing visible may belong to another tenant. Zero visible rows is
+        # correct isolation too, so the assertion is on foreign rows, not on
+        # the number of distinct tenants.
+        foreign = [row for row in rows if row.get("tenant_id") != my_tenant]
+        print(f"foreign_invocation_rows={len(foreign)}")
+        foreign_conns = [
+            item for item in conns if item.get("tenant_id", my_tenant) != my_tenant
+        ]
+        print(f"foreign_connector_rows={len(foreign_conns)}")
+
+        # Rows belonging to any other tenant must be invisible. The database
+        # is seeded with rows under a different tenant by earlier runs.
+        made = await c.post(
+            f"{GW}/v1/connectors",
+            headers=auth,
+            json={
+                "name": f"iso-{_uuid.uuid4().hex[:8]}",
+                "kind": "http",
+                "config": {
+                    "base_url": "http://testprovider:9099",
+                    "allowed_hosts": ["testprovider"],
+                },
+            },
+        )
+        print(f"scoped_create_status={made.status_code}")
+        again = await c.get(f"{GW}/v1/connectors", headers=auth)
+        after = again.json() if again.status_code == 200 else []
+        print(f"visible_grew_by={len(after) - len(conns)}")
 
 
 asyncio.run(main())
@@ -95,14 +148,26 @@ PY
 )
 echo "$RESULT" | sed 's/^/    /'
 
-get() { echo "$RESULT" | grep "^$1=" | cut -d= -f2 | tr -d ' \r'; }
+get() { expect_key "$RESULT" "$1"; }
+
+# The driver must have produced output at all; an empty RESULT means the
+# container command failed before printing anything.
+if [ -z "$(echo "$RESULT" | tr -d '[:space:]')" ]; then
+  echo "  ERROR driver produced no output at all"
+  exit 1
+fi
 
 check "forged X-Userinfo leaks no other-tenant rows" "$(get forged_leaked_rows)" "0"
 check "unauthenticated read is rejected at the gateway" "$(get anonymous_status)" "401"
 check "authenticated read succeeds" "$(get authenticated_status)" "200"
-check "results span exactly one tenant" "$(get distinct_tenants)" "1"
+
 check "unknown connector id returns 404, not 403" "$(get foreign_connector_get)" "404"
 check "connector listing is tenant-scoped" "$(get connector_list_status)" "200"
+check "tenant comes from a token claim, not a default" "$(get token_tenant)" "favl-demo"
+check "no visible invocation belongs to another tenant" "$(get foreign_invocation_rows)" "0"
+check "no visible connector belongs to another tenant" "$(get foreign_connector_rows)" "0"
+check "creating a connector succeeds under that tenant" "$(get scoped_create_status)" "201"
+check "only the caller's own new row becomes visible" "$(get visible_grew_by)" "1"
 
 printf '\n---------------------------------------------\n'
 printf 'passed: %d   failed: %d\n' "$PASS" "$FAIL"
