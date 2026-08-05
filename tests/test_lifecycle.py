@@ -5,6 +5,7 @@ that no state is executable by accident, that revocation is one-way, and that
 every reachable state is actually reachable.
 """
 
+import os
 import sys
 from pathlib import Path
 
@@ -12,6 +13,15 @@ import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "services" / "connector-registry"))
+
+# `app.db` builds its engine at import time and refuses to be imported without
+# a URL — deliberately, so a service cannot start pointing at nothing. These
+# are pure-function tests that never open a connection, so a dummy URL is
+# supplied rather than weakening that check. `setdefault` so a real DATABASE_URL
+# in the environment still wins.
+os.environ.setdefault(
+    "DATABASE_URL", "postgresql+asyncpg://unused:unused@127.0.0.1:1/unused"
+)
 
 from app.lifecycle import (  # noqa: E402
     EXECUTABLE_STATES,
@@ -197,3 +207,137 @@ class TestIdempotency:
 
     def test_a_different_target_is_never_an_idempotent_repeat(self):
         assert not is_idempotent_repeat("enabled", "disabled")
+
+
+class TestInvocationRefusal:
+    """`check_executable` is the enforcement point the state machine feeds.
+
+    These tests exist because the unit tests above prove the PREDICATE while
+    this proves the PATH — the place an invocation actually consults it.
+    """
+
+    @staticmethod
+    def _record(state):
+        class _Stub:
+            status = state
+
+        return _Stub()
+
+    def test_only_enabled_passes_the_gate(self):
+        from app.invocations import ConnectorNotExecutable, check_executable
+
+        check_executable(self._record("enabled"))
+        for state in ConnectorState:
+            if state is ConnectorState.ENABLED:
+                continue
+            with pytest.raises(ConnectorNotExecutable):
+                check_executable(self._record(state.value))
+
+    def test_revoked_is_distinguishable_from_disabled(self):
+        """A caller that cannot tell them apart retries the wrong one forever."""
+        from app.invocations import ConnectorNotExecutable, check_executable
+
+        with pytest.raises(ConnectorNotExecutable) as revoked:
+            check_executable(self._record("revoked"))
+        with pytest.raises(ConnectorNotExecutable) as disabled:
+            check_executable(self._record("disabled"))
+        assert revoked.value.code.value == "CONNECTOR_REVOKED"
+        assert revoked.value.http_status == 403
+        assert disabled.value.code.value == "CONNECTOR_DISABLED"
+        assert disabled.value.http_status == 409
+
+    def test_an_unmapped_state_is_refused_not_admitted(self):
+        """The guard runs BEFORE the refusal mapping.
+
+        A state added to the enum but forgotten in `_REFUSAL` must still be
+        refused — less helpfully, but refused. A mapping consulted first would
+        let it fall through to success.
+        """
+        from app.invocations import ConnectorNotExecutable, check_executable
+
+        with pytest.raises(ConnectorNotExecutable):
+            check_executable(self._record("some_future_state"))
+
+    def test_every_state_has_an_explicit_refusal(self):
+        """The default exists as a backstop, not as the normal path."""
+        from app.invocations import _REFUSAL
+
+        missing = [
+            s.value
+            for s in ConnectorState
+            if s is not ConnectorState.ENABLED and s.value not in _REFUSAL
+        ]
+        assert not missing, f"states with no explicit refusal: {missing}"
+
+
+class TestIdempotentRepeatLookup:
+    """The repeat shortcut searches transitions INTO the target.
+
+    A live test caught `apply` looking for a self-loop instead — `disabled ->
+    disabled` is not in the table, so every retried disable and every retried
+    revoke returned 409. The unit tests at the time all passed, because they
+    exercised `is_idempotent_repeat` directly and never the lookup order.
+    """
+
+    def test_the_edge_marked_idempotent_is_not_the_edge_being_repeated(self):
+        from app.lifecycle import find, idempotent_repeat
+
+        # `enabled -> disabled` is what carries the flag...
+        assert find("enabled", "disabled").idempotent
+        # ...but `disabled -> disabled` is what a retry asks for, and it is
+        # not in the table at all.
+        with pytest.raises(TransitionError):
+            find("disabled", "disabled", "connector.disabled")
+        # The shortcut must still recognise it.
+        assert idempotent_repeat("disabled", "disabled") is not None
+
+    def test_a_meaningful_self_loop_is_a_real_transition_not_a_repeat(self):
+        """Rotating credentials on a disabled connector must be recorded.
+
+        If the repeat shortcut were consulted first, this would return "already
+        in that state" and lose the audit entry — which, for a credential
+        rotation, is the only thing the operation produces.
+        """
+        from app.lifecycle import find
+
+        transition = find("disabled", "disabled", "connector.credentials_rotated")
+        assert transition.event == "connector.credentials_rotated"
+
+    @pytest.mark.parametrize(
+        "state", ["disabled", "revoked", "deletion_requested", "archived"]
+    )
+    def test_every_idempotent_target_resolves(self, state):
+        from app.lifecycle import idempotent_repeat
+
+        assert idempotent_repeat(state, state) is not None
+
+    def test_enabled_is_not_a_repeatable_target(self):
+        from app.lifecycle import idempotent_repeat
+
+        assert idempotent_repeat("enabled", "enabled") is None
+
+
+class TestCreationGuard:
+    def test_creation_cannot_enter_a_guarded_state(self):
+        """Creation has no source state, so the machine cannot police it.
+
+        Without the explicit allowlist a caller could create a connector
+        already `revoked` or `archived`, skipping the reason those states
+        require and producing a first audit entry that contradicts itself.
+        """
+        from app.lifecycle import CREATABLE_STATES
+
+        forbidden = {
+            ConnectorState.REVOKED,
+            ConnectorState.ARCHIVED,
+            ConnectorState.DELETION_REQUESTED,
+            ConnectorState.DELETED,
+        }
+        leaked = forbidden & CREATABLE_STATES
+        assert not leaked, f"creatable but should not be: {[s.value for s in leaked]}"
+
+    def test_the_ordinary_states_remain_creatable(self):
+        from app.lifecycle import CREATABLE_STATES
+
+        assert ConnectorState.DRAFT in CREATABLE_STATES
+        assert ConnectorState.ENABLED in CREATABLE_STATES

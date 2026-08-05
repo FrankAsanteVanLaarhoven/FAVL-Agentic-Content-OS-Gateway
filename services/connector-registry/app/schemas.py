@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import uuid
 from datetime import datetime
-from enum import Enum
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, HttpUrl, field_validator
+
+from .lifecycle import CREATABLE_STATES, ConnectorState
 
 ConnectorKind = Literal["http", "mcp", "webhook", "internal"]
 
@@ -25,12 +27,10 @@ OPERATOR_ONLY_CONFIG_KEYS = frozenset(
 )
 
 
-class ConnectorStatusSchema(str, Enum):
-    DRAFT = "draft"
-    ENABLED = "enabled"
-    DISABLED = "disabled"
-    DELETION_REQUESTED = "deletion_requested"
-    DELETED = "deleted"
+# One lifecycle enum for the whole service. The API schema previously kept
+# its own copy, so the OpenAPI contract advertised five states while the
+# database accepted ten.
+ConnectorStatusSchema = ConnectorState
 
 
 class ConnectorCreate(BaseModel):
@@ -43,14 +43,21 @@ class ConnectorCreate(BaseModel):
 
     @field_validator("status")
     @classmethod
-    def _no_terminal_status_on_create(
+    def _only_creatable_states(
         cls, value: ConnectorStatusSchema
     ) -> ConnectorStatusSchema:
-        if value in (
-            ConnectorStatusSchema.DELETION_REQUESTED,
-            ConnectorStatusSchema.DELETED,
-        ):
-            raise ValueError("a connector cannot be created in a deletion state")
+        """Creation has no source state, so the machine cannot police it here.
+
+        Without this, a caller could create a connector already `revoked` or
+        `archived` — skipping the reason those states require and producing a
+        first audit entry that contradicts the state it describes.
+        """
+        if value not in CREATABLE_STATES:
+            raise ValueError(
+                f"a connector cannot be created in state '{value.value}'; "
+                f"creatable states are "
+                f"{sorted(s.value for s in CREATABLE_STATES)}"
+            )
         return value
 
     @field_validator("config")
@@ -91,6 +98,14 @@ class Connector(BaseModel):
     created_at: datetime
     deletion_requested_at: datetime | None = None
     deleted_at: datetime | None = None
+    revoked_at: datetime | None = None
+    archived_at: datetime | None = None
+    credentials_rotated_at: datetime | None = None
+    # The reason recorded with the most recent transition. The full history,
+    # with an actor per entry, is at GET /v1/connectors/{id}/audit — this is
+    # the answer to "why is it in this state right now", not a substitute for
+    # the trail.
+    state_reason: str | None = None
     supports_idempotency: bool = False
     idempotency_mode: str = "unsupported"
 
@@ -139,3 +154,29 @@ class HealthReport(BaseModel):
     detail: str = ""
     checked_at: datetime | None = None
     latency_ms: float | None = None
+
+
+class TransitionRequest(BaseModel):
+    """Body for every lifecycle transition endpoint.
+
+    `reason` is required by the state machine for suspensions, revocations and
+    deletions — see `lifecycle.Transition.requires_reason`. It is optional here
+    and enforced there, so the requirement lives in one place.
+    """
+
+    reason: str | None = Field(default=None, max_length=1024)
+    idempotency_key: str | None = Field(default=None, max_length=255)
+
+
+class AuditEntry(BaseModel):
+    """One immutable lifecycle transition record."""
+
+    id: uuid.UUID
+    connector_id: uuid.UUID
+    from_state: str
+    to_state: str
+    event: str
+    actor_id: str
+    reason: str | None
+    aggregate_version: int
+    recorded_at: datetime

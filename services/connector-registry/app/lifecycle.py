@@ -259,17 +259,54 @@ def permitted_targets(source: str) -> list[str]:
     return sorted({t.target.value for t in TRANSITIONS if t.source == frm})
 
 
-def is_idempotent_repeat(current: str, target: str) -> bool:
-    """Whether re-requesting a state the connector already holds is a success.
+def idempotent_repeat(current: str, target: str) -> Transition | None:
+    """The transition that makes re-requesting a held state a success.
 
-    An operator retrying after a timeout cannot know whether the first
-    attempt landed, so a repeated disable or revoke returns success rather
-    than a conflict. Enabling is deliberately excluded: re-enabling is a
-    decision, and a caller who thinks a connector is disabled when it is
-    enabled should learn that.
+    An operator retrying after a timeout cannot know whether the first attempt
+    landed, so a repeated disable or revoke returns success rather than a
+    conflict. Enabling is deliberately excluded: re-enabling is a decision,
+    and a caller who thinks a connector is disabled when it is enabled should
+    learn that.
+
+    Note what is searched: transitions INTO the target, not edges from the
+    target to itself. `enabled -> disabled` is the edge marked idempotent, and
+    the repeat being asked about is `disabled -> disabled`, which is not in
+    the table at all. Looking for the self-loop instead finds nothing and
+    turns every retry into a 409 — which is exactly what the live test caught.
     """
     if current != target:
-        return False
-    return any(
-        t.idempotent for t in TRANSITIONS if t.target.value == target and t.idempotent
-    )
+        return None
+    for transition in TRANSITIONS:
+        if transition.target.value == target and transition.idempotent:
+            return transition
+    return None
+
+
+def is_idempotent_repeat(current: str, target: str) -> bool:
+    """Whether re-requesting a state the connector already holds is a success."""
+    return idempotent_repeat(current, target) is not None
+
+
+# States a connector may be CREATED in.
+#
+# Creation is not a transition — it has no source state — so the machine
+# cannot police it, and the create endpoint was free to place a connector
+# straight into any status the request body named. That let a caller create
+# one already `revoked` or `archived`, skipping the reason requirement and
+# producing an audit trail whose first entry contradicts the state.
+#
+# `enabled` is permitted here because the create path runs the very same
+# `validate_config` the CONFIGURED -> VALIDATED edge runs, so the "no
+# unvalidated configuration reaches a provider" invariant still holds. The
+# one-way and deletion states are not, because reaching them legitimately
+# requires a reason and a prior state.
+CREATABLE_STATES: frozenset[ConnectorState] = frozenset(
+    {
+        ConnectorState.DRAFT,
+        ConnectorState.INSTALLED,
+        ConnectorState.CONFIGURED,
+        ConnectorState.VALIDATED,
+        ConnectorState.ENABLED,
+        ConnectorState.DISABLED,
+    }
+)

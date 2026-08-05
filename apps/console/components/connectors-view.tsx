@@ -10,7 +10,12 @@ import {
   StatusDot,
   relativeTime,
 } from "@/components/primitives";
-import { connectorTone, type Connector } from "@/lib/types";
+import {
+  connectorTone,
+  transitionTone,
+  type AuditEntry,
+  type Connector,
+} from "@/lib/types";
 
 async function get<T>(url: string): Promise<T> {
   const response = await fetch(url);
@@ -20,6 +25,53 @@ async function get<T>(url: string): Promise<T> {
 
 /** Config keys whose value must never be rendered, defence in depth. */
 const SENSITIVE = /(secret|token|password|key|credential)/i;
+
+/** Immutable transition history for one connector. */
+function LifecycleTrail({ connectorId }: { connectorId: string }) {
+  const { data, isLoading, error } = useQuery<AuditEntry[]>({
+    queryKey: ["connector-audit", connectorId],
+    queryFn: () => get(`/api/connectors/${connectorId}/audit`),
+    refetchInterval: 10000,
+  });
+
+  if (isLoading) return <Empty title="Loading…" />;
+  if (error) return <Empty title="Audit unavailable" body={String(error)} />;
+  if (!data?.length) return <Empty title="No transitions recorded" />;
+
+  // Newest first: the question asked of an audit trail is almost always
+  // "what happened most recently", and scrolling to the bottom to answer it
+  // is a small tax paid on every single visit.
+  const entries = [...data].reverse();
+
+  return (
+    <ol className="px-3 pb-2">
+      {entries.map((entry) => (
+        <li
+          key={entry.id}
+          className="border-l border-[var(--color-line)] py-1.5 pl-3 last:pb-0"
+        >
+          <div className="flex items-baseline justify-between gap-2">
+            <StatusDot
+              tone={transitionTone(entry.to_state)}
+              label={entry.event.replace(/^connector\./, "")}
+            />
+            <span className="tabular shrink-0 text-[10px] text-[var(--color-faint)]">
+              v{entry.aggregate_version} · {relativeTime(entry.recorded_at)}
+            </span>
+          </div>
+          <p className="truncate font-mono text-[10px] text-[var(--color-faint)]">
+            {entry.from_state || "—"} → {entry.to_state} · {entry.actor_id}
+          </p>
+          {entry.reason ? (
+            <p className="pt-0.5 text-[11px] text-[var(--color-muted)]">
+              {entry.reason}
+            </p>
+          ) : null}
+        </li>
+      ))}
+    </ol>
+  );
+}
 
 export function ConnectorsView() {
   const [includeDeleted, setIncludeDeleted] = useState(false);
@@ -122,6 +174,25 @@ export function ConnectorsView() {
                 {selected.version}
               </Field>
               <Field label="Created">{relativeTime(selected.created_at)}</Field>
+              {selected.revoked_at ? (
+                <Field label="Revoked">
+                  <span className="text-[var(--color-err)]">
+                    {relativeTime(selected.revoked_at)}
+                  </span>
+                </Field>
+              ) : null}
+              {selected.state_reason ? (
+                <Field label="Reason">
+                  <span className="text-[var(--color-muted)]">
+                    {selected.state_reason}
+                  </span>
+                </Field>
+              ) : null}
+              {selected.credentials_rotated_at ? (
+                <Field label="Creds rotated">
+                  {relativeTime(selected.credentials_rotated_at)}
+                </Field>
+              ) : null}
               {selected.deletion_requested_at ? (
                 <Field label="Deletion req.">
                   <span className="text-[var(--color-warn)]">
@@ -133,6 +204,12 @@ export function ConnectorsView() {
                 {selected.scopes.length ? selected.scopes.join(", ") : "—"}
               </Field>
             </dl>
+            <div className="hairline py-1">
+              <h3 className="px-3 pb-1 pt-1.5 text-[10px] uppercase tracking-[0.1em] text-[var(--color-faint)]">
+                Lifecycle
+              </h3>
+              <LifecycleTrail connectorId={selected.id} />
+            </div>
             <div className="py-1">
               <h3 className="px-3 pb-1 pt-1.5 text-[10px] uppercase tracking-[0.1em] text-[var(--color-faint)]">
                 Configuration

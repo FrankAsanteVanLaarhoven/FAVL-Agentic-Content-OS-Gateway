@@ -7,7 +7,18 @@ import {
   type Tone,
 } from "./types";
 
-const INVOCATION_STATUSES: InvocationStatus[] = [
+// These lists are hand-written, so they drift. When the registry gained five
+// connector states this file still listed five, and the "every status maps to
+// a tone" test kept passing while five statuses had no mapping at all — the
+// test was exhaustive over the list, not over the type.
+//
+// `Covers<Union, List>` closes that: it resolves to `true` only when the list
+// contains every member of the union, so a status added to the type and not
+// to the list fails to compile rather than silently going untested.
+type Covers<Union extends string, List extends readonly string[]> =
+  Exclude<Union, List[number]> extends never ? true : never;
+
+const INVOCATION_STATUSES = [
   "accepted",
   "running",
   "succeeded",
@@ -15,15 +26,27 @@ const INVOCATION_STATUSES: InvocationStatus[] = [
   "failed_terminal",
   "timed_out",
   "cancelled",
-];
+] as const satisfies readonly InvocationStatus[];
 
-const CONNECTOR_STATUSES: ConnectorStatus[] = [
+const CONNECTOR_STATUSES = [
   "draft",
+  "installed",
+  "configured",
+  "validated",
   "enabled",
   "disabled",
+  "revoked",
   "deletion_requested",
+  "archived",
   "deleted",
-];
+] as const satisfies readonly ConnectorStatus[];
+
+const _invocationsCovered: Covers<InvocationStatus, typeof INVOCATION_STATUSES> =
+  true;
+const _connectorsCovered: Covers<ConnectorStatus, typeof CONNECTOR_STATUSES> =
+  true;
+void _invocationsCovered;
+void _connectorsCovered;
 
 const TONES: Tone[] = ["ok", "warn", "err", "info", "idle"];
 

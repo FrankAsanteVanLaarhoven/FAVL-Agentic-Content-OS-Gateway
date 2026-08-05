@@ -1,0 +1,23 @@
+Migration 0008 rollback, 2026-08-05.
+
+$ alembic downgrade 0007
+INFO  [alembic.runtime.migration] Running downgrade 0008 -> 0007, connector lifecycle states and immutable transition audit
+
+audit table dropped (t = yes):
+t
+constraint narrowed to the 0007 state set:
+CHECK (((status)::text = ANY ((ARRAY['draft'::character varying, 'enabled'::character varying, 'disabled'::character varying, 'deletion_requested'::character varying, 'deleted'::character varying])::text[])))
+rows parked in states the old constraint permits:
+deletion_requested = 1
+disabled = 6
+enabled = 48
+
+$ alembic upgrade head
+INFO  [alembic.runtime.migration] Running upgrade 0007 -> 0008, connector lifecycle states and immutable transition audit
+0008 (head)
+audit table restored (t = yes):
+t
+
+NOTE: the downgrade DESTROYS connector_audit — every recorded transition,
+with its actor and reason. It is verified to run, not recommended.
+See the docstring of migrations/versions/0008_connector_lifecycle.py.

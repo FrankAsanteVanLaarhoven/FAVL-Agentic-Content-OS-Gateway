@@ -1,8 +1,18 @@
+// Mirrors ConnectorState in services/connector-registry/app/lifecycle.py.
+// The registry gained five states in migration 0008 while this union still
+// listed five; the API was returning `validated` and `revoked` to a type that
+// said they could not occur, and connectorTone's switch fell through to
+// undefined for them.
 export type ConnectorStatus =
   | "draft"
+  | "installed"
+  | "configured"
+  | "validated"
   | "enabled"
   | "disabled"
+  | "revoked"
   | "deletion_requested"
+  | "archived"
   | "deleted";
 
 export type Connector = {
@@ -17,6 +27,10 @@ export type Connector = {
   created_at: string;
   deletion_requested_at: string | null;
   deleted_at: string | null;
+  revoked_at?: string | null;
+  archived_at?: string | null;
+  credentials_rotated_at?: string | null;
+  state_reason?: string | null;
   supports_idempotency?: boolean;
   idempotency_mode?: string;
 };
@@ -108,12 +122,36 @@ export function connectorTone(status: ConnectorStatus): Tone {
   switch (status) {
     case "enabled":
       return "ok";
+    case "validated":
+      return "ok";
     case "draft":
+    case "installed":
+    case "configured":
     case "disabled":
       return "idle";
     case "deletion_requested":
       return "warn";
+    case "revoked":
+    case "archived":
     case "deleted":
       return "err";
   }
+}
+
+/** One immutable lifecycle transition. Mirrors AuditEntry in the registry. */
+export type AuditEntry = {
+  id: string;
+  connector_id: string;
+  from_state: string;
+  to_state: string;
+  event: string;
+  actor_id: string;
+  reason: string | null;
+  aggregate_version: number;
+  recorded_at: string;
+};
+
+/** Tone for a transition, by the state it lands in. */
+export function transitionTone(toState: string): Tone {
+  return connectorTone(toState as ConnectorStatus) ?? "info";
 }

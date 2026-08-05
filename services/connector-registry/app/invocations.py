@@ -28,7 +28,8 @@ from .adapters.base import (
     InvocationStatus,
 )
 from .adapters.registry import AdapterRegistry, UnknownAdapterKind
-from .models import ConnectorRecord, ConnectorStatus, InvocationRecord
+from .lifecycle import ConnectorState, is_executable
+from .models import ConnectorRecord, InvocationRecord
 from .outbox import OutboxEvent
 
 logger = logging.getLogger(__name__)
@@ -89,19 +90,41 @@ class ReplayedInvocation:
 def check_executable(record: ConnectorRecord) -> None:
     """Reject every non-executable lifecycle state explicitly.
 
+    The permit decision is delegated to `lifecycle.is_executable` — the single
+    source of truth for "may this serve traffic". Everything below the guard
+    only chooses which refusal the caller sees; a state added to the enum but
+    not to this mapping is still refused, just less helpfully. That ordering
+    matters: a mapping consulted BEFORE the guard would let an unmapped state
+    fall through to success.
+
     410 for deleted rather than 404: the caller is authenticated and
     authorised to know the connector existed, and Gone is actionable where a
     bare Not Found is not.
     """
     status = record.status
-    if status == ConnectorStatus.ENABLED.value:
+    if is_executable(status):
         return
-    if status == ConnectorStatus.DELETION_REQUESTED.value:
-        raise ConnectorNotExecutable(status, ErrorCode.CONNECTOR_DELETION_PENDING, 409)
-    if status == ConnectorStatus.DELETED.value:
-        raise ConnectorNotExecutable(status, ErrorCode.CONNECTOR_GONE, 410)
-    # draft and disabled
-    raise ConnectorNotExecutable(status, ErrorCode.CONNECTOR_DISABLED, 409)
+
+    code, http_status = _REFUSAL.get(status, (ErrorCode.CONNECTOR_DISABLED, 409))
+    raise ConnectorNotExecutable(status, code, http_status)
+
+
+# How each non-executable state is reported. Consulted only after the
+# executability guard has already refused.
+_REFUSAL: dict[str, tuple[ErrorCode, int]] = {
+    ConnectorState.REVOKED.value: (ErrorCode.CONNECTOR_REVOKED, 403),
+    ConnectorState.DELETION_REQUESTED.value: (
+        ErrorCode.CONNECTOR_DELETION_PENDING,
+        409,
+    ),
+    ConnectorState.ARCHIVED.value: (ErrorCode.CONNECTOR_GONE, 410),
+    ConnectorState.DELETED.value: (ErrorCode.CONNECTOR_GONE, 410),
+    ConnectorState.DRAFT.value: (ErrorCode.CONNECTOR_NOT_VALIDATED, 409),
+    ConnectorState.INSTALLED.value: (ErrorCode.CONNECTOR_NOT_VALIDATED, 409),
+    ConnectorState.CONFIGURED.value: (ErrorCode.CONNECTOR_NOT_VALIDATED, 409),
+    ConnectorState.VALIDATED.value: (ErrorCode.CONNECTOR_NOT_VALIDATED, 409),
+    ConnectorState.DISABLED.value: (ErrorCode.CONNECTOR_DISABLED, 409),
+}
 
 
 def _emit(

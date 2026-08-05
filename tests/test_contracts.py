@@ -7,6 +7,7 @@ without the stack running. Integration behaviour is verified against the
 live stack; see README "Verifying persistence".
 """
 
+import importlib.machinery
 import importlib.util
 import sys
 from pathlib import Path
@@ -18,12 +19,28 @@ SERVICES = Path(__file__).resolve().parents[1] / "services"
 
 
 def _load(service: str, alias: str):
-    path = SERVICES / service / "app" / "schemas.py"
-    spec = importlib.util.spec_from_file_location(alias, path)
+    """Load a service's schema module with its package context intact.
+
+    A synthetic package is registered under `alias` with `__path__` pointing
+    at that service's `app/` directory, so a relative import inside the module
+    resolves to that service's sibling — not the other service's file of the
+    same name. Loading `schemas.py` bare instead would work only for as long
+    as it imported nothing local, which is a constraint on the source rather
+    than on the test, and the wrong way round.
+    """
+    app_dir = SERVICES / service / "app"
+    package = importlib.util.module_from_spec(
+        importlib.machinery.ModuleSpec(alias, None, is_package=True)
+    )
+    package.__path__ = [str(app_dir)]
+    sys.modules[alias] = package
+
+    name = f"{alias}.schemas"
+    spec = importlib.util.spec_from_file_location(name, app_dir / "schemas.py")
     module = importlib.util.module_from_spec(spec)
     # Must be registered before exec: the modules use `from __future__ import
     # annotations`, so pydantic resolves forward refs via sys.modules.
-    sys.modules[alias] = module
+    sys.modules[name] = module
     spec.loader.exec_module(module)
     return module
 

@@ -1,0 +1,60 @@
+== connector lifecycle: states, transitions, and revocation immediacy ==
+
+-- 1. the machine refuses what it should, in order --
+  PASS  create lands in draft                                      draft
+  PASS  enable from draft refused                                  409
+  PASS  refusal names the error                                    TRANSITION_NOT_PERMITTED
+  PASS  refusal names where to go                                  installed,revoked
+  PASS  install advances                                           installed
+  PASS  configure advances                                         configured
+  PASS  enable before validation refused                           409
+  PASS  validate reports valid                                     True
+  PASS  validate moves the state                                   validated
+  PASS  enable succeeds once validated                             enabled
+  PASS  enabled connector serves                                   200
+
+-- 2. reasons and idempotency --
+  PASS  disable without reason refused                             422
+  PASS  refusal names the missing reason                           REASON_REQUIRED
+  PASS  disable with reason succeeds                               200
+  PASS  repeating a disable is a success                           200
+  PASS  disabled connector refuses                                 409
+  PASS  refusal distinguishes disabled                             CONNECTOR_DISABLED
+  PASS  disabled may be re-enabled                                 200
+
+-- 3. THE GATE: revocation takes effect on the next request --
+  PASS  connector was live before revoke                           enabled
+  PASS  revoke succeeds mid-flight                                 200
+  PASS  state is revoked                                           revoked
+  PASS  NEXT invocation is refused                                 403
+  PASS  refusal distinguishes revoked                              CONNECTOR_REVOKED
+  PASS  revoked cannot be re-enabled                               409
+  PASS  revoked cannot be reconfigured                             409
+  PASS  repeating a revoke is a success                            200
+  INFO  refusal observed after revoke                              22 ms
+  INFO  in-flight invocation outcome (reported, not required)      200
+
+-- 4. archival --
+  PASS  archive succeeds                                           200
+  PASS  archived connector refuses                                 410
+
+-- 5. the audit trail is complete and ordered --
+  PASS  audit readable                                             200
+  PASS  every transition recorded                                  created,installed,configured,validation_succeeded,enabled,disabled,enabled,revoked,archived
+  PASS  versions strictly increasing                               1
+  PASS  one revocation recorded                                    1
+  PASS  revocation carries its reason                              credential suspected compromised
+  PASS  revocation names an actor                                  1
+
+-- 6. creation cannot enter a state the machine guards --
+  PASS  cannot create as revoked                                   422
+  PASS  cannot create as archived                                  422
+  PASS  cannot create as deleted                                   422
+  PASS  may create as enabled (validated on create)                201
+
+-- 7. the audit table is append-only in the database --
+  PASS  UPDATE is refused                                          yes
+  PASS  DELETE is refused                                          yes
+  PASS  connector row protected by audit FK                        yes
+
+== 41 passed, 0 failed ==

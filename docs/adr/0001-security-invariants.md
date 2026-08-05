@@ -287,6 +287,50 @@ Enforced by `--web.enable-lifecycle` and the drift assertion in
 **Failure observed** — the drift check was written against the stale state
 and reported it.
 
+## I12 — Revocation prevents new use immediately, not eventually
+
+Executability is a property of the connector row, read inside the transaction
+that is about to use it. It is never cached, never derived from an event, and
+never held in a worker's memory. `lifecycle.is_executable` is the only
+function that answers "may this serve traffic", and `EXECUTABLE_STATES` is a
+set of exactly one, so a state added to the enum is non-executable until
+somebody puts it there deliberately.
+
+The corollaries that make this hold rather than merely sound true:
+
+- The executability guard runs **before** the refusal mapping. A state present
+  in the enum but missing from `_REFUSAL` is refused with a generic code, not
+  admitted. The reverse ordering — look up how to refuse, admit if unknown —
+  reads almost identically and is a bypass.
+- Events describe what happened; they do not decide what is permitted. A
+  consumer that had not yet seen `connector.revoked` changes nothing.
+- Revocation is one-way in the transition table. Restoring a revoked connector
+  would return a compromised credential to service without rotating it.
+- Creation is not a transition and so the machine cannot police it.
+  `CREATABLE_STATES` polices it instead; without that list a caller could
+  create a connector already `revoked`, skipping the reason that state
+  requires.
+
+Enforced by `services/connector-registry/app/lifecycle.py` and the guard in
+`invocations.check_executable`. Guarded by `tests/test_lifecycle.py` (33
+tests) and by eight mutations in `scripts/mutate.py`.
+
+**Failure observed** — twice, and neither by the unit tests.
+
+`tests/verify_lifecycle.sh` section 3 revokes a connector while an invocation
+is in flight and asserts the next one is refused; with `REVOKED` added to
+`EXECUTABLE_STATES` it returned 200. That is the failure the invariant exists
+to prevent, and it was watched happening.
+
+The second was subtler and is the reason the live test exists at all. Every
+unit test passed while `transitions.apply` looked for an idempotent *self*
+edge (`disabled -> disabled`) instead of an idempotent edge *into* the target
+(`enabled -> disabled`), so every retried disable and every retried revoke
+returned 409. An operator retrying a revocation after a timeout would have
+been told the revocation failed. The unit tests exercised the predicate
+directly and never the lookup order; only a real retry against the running
+system found it.
+
 ## Consequences
 
 Changes touching `security/`, `identity.py`, the `proxy-rewrite` blocks in
@@ -304,5 +348,8 @@ needs a superseding ADR, not a code comment.
 | Identity provider runs in development mode against H2 | Not internet-exposed; realm is repository-controlled | M1.7 |
 | Secrets resolve from environment variables | Names are derived, never caller-supplied; scoped by owner | M1.7 |
 | No tenant administration; tenant comes from one user attribute | Claim is IdP-issued and unforgeable through the gateway | M3 |
-| Agents may reference a connector id from another tenant at creation | Invocation is refused at fan-out; only the reference is permitted | M1.4 |
+| Agents may reference a connector id from another tenant at creation | Invocation is refused at fan-out; only the reference is permitted | M1.5 |
+| An in-flight invocation completes after its connector is revoked | Revocation blocks new use; work already accepted runs to its deadline. Reported by `verify_lifecycle.sh`, not asserted as a requirement | open — needs a decision, not a fix |
+| Physical deletion (`archived -> deleted`) has no endpoint | The transition is defined and privileged; nothing can reach it yet | M1.5 |
+| Rolling back migration 0008 destroys the audit trail | Documented in the migration; dump `connector_audit` before downgrading | accepted |
 | A config change can sit undeployed | `verify_alerts.sh` compares the running rule set against the file; `--web.enable-lifecycle` makes reload possible | closed |

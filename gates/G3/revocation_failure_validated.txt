@@ -1,0 +1,29 @@
+Failure validation of the M1.4 gate, 2026-08-05.
+
+Defect reintroduced in services/connector-registry/app/lifecycle.py:
+
+    EXECUTABLE_STATES: frozenset[ConnectorState] = frozenset(
+        {ConnectorState.ENABLED, ConnectorState.REVOKED}
+    )
+
+Service rebuilt, tests/verify_lifecycle.sh re-run:
+
+-- 3. THE GATE: revocation takes effect on the next request --
+  PASS  connector was live before revoke                           enabled
+  PASS  revoke succeeds mid-flight                                 200
+  PASS  state is revoked                                           revoked
+  FAIL  NEXT invocation is refused                                 got=200 want=403
+  FAIL  refusal distinguishes revoked                              got=None want=CONNECTOR_REVOKED
+  PASS  revoked cannot be re-enabled                               409
+  PASS  revoked cannot be reconfigured                             409
+  PASS  repeating a revoke is a success                            200
+  INFO  refusal observed after revoke                              148 ms
+  INFO  in-flight invocation outcome (reported, not required)      200
+
+Note which assertions still passed: the state machine still refused to
+re-enable or reconfigure a revoked connector, and the row still said
+"revoked". Everything looked correct except the one thing that mattered —
+the connector kept serving traffic. This is why the transition tests alone
+are not sufficient evidence for the invariant.
+
+Defect reverted, service rebuilt, suite returned to 41 passed / 0 failed.

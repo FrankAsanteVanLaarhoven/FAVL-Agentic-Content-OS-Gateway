@@ -21,6 +21,11 @@ class ErrorCode(str, Enum):
     CONNECTOR_DISABLED = "CONNECTOR_DISABLED"
     CONNECTOR_DELETION_PENDING = "CONNECTOR_DELETION_PENDING"
     CONNECTOR_GONE = "CONNECTOR_GONE"
+    # Distinct from CONNECTOR_DISABLED: a disabled connector may be re-enabled,
+    # a revoked one may not. A caller that cannot tell the two apart will retry
+    # the wrong one forever.
+    CONNECTOR_REVOKED = "CONNECTOR_REVOKED"
+    CONNECTOR_NOT_VALIDATED = "CONNECTOR_NOT_VALIDATED"
     SECRET_NOT_FOUND = "SECRET_NOT_FOUND"
     SSRF_BLOCKED = "SSRF_BLOCKED"
     HOST_NOT_ALLOWED = "HOST_NOT_ALLOWED"

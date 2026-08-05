@@ -66,6 +66,9 @@ test-identity:
 
 # Drives an alert through fire-and-clear against the live stack. Slow by
 # nature: the rules carry for-clauses measured in minutes.
+test-lifecycle:
+	./tests/verify_lifecycle.sh
+
 test-alerts:
 	bash tests/verify_alerts.sh
 

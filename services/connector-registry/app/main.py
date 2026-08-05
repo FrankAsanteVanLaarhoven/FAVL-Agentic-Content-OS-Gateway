@@ -19,11 +19,18 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from favl_outbox import enqueue
 
 from . import invocations as inv
+from . import transitions as tr
 from .adapters.base import ConnectorContext, InvocationStatus
 from .adapters.registry import UnknownAdapterKind, build_registry, registry_snapshot
 from .db import SessionLocal, engine, get_session
 from .identity import CallerIdentity, current_identity, current_tenant
-from .models import ConnectorRecord, ConnectorStatus, InvocationRecord
+from .lifecycle import ConnectorState
+from .models import (
+    ConnectorAuditRecord,
+    ConnectorRecord,
+    ConnectorStatus,
+    InvocationRecord,
+)
 from .outbox import (
     WINDOW_UTILISATION,
     OutboxEvent,
@@ -32,11 +39,13 @@ from .outbox import (
     publisher_enabled,
 )
 from .schemas import (
+    AuditEntry,
     Connector,
     ConnectorCreate,
     HealthReport,
     Invocation,
     InvocationCreate,
+    TransitionRequest,
     ValidationReport,
 )
 from .security.policy import clamp_timeout
@@ -48,7 +57,7 @@ logger = logging.getLogger(__name__)
 __all__ = ["Connector", "ConnectorCreate", "app"]
 
 ADAPTERS = build_registry()
-EXPECTED_MIGRATION = os.getenv("EXPECTED_MIGRATION", "0007")
+EXPECTED_MIGRATION = os.getenv("EXPECTED_MIGRATION", "0008")
 
 # /internal/* bypasses APISIX, so it carries no OIDC token. It is protected
 # by a shared service credential compared in constant time, in addition to
@@ -120,6 +129,10 @@ def _to_schema(record: ConnectorRecord) -> Connector:
             "created_at": record.created_at,
             "deletion_requested_at": record.deletion_requested_at,
             "deleted_at": record.deleted_at,
+            "revoked_at": record.revoked_at,
+            "archived_at": record.archived_at,
+            "credentials_rotated_at": record.credentials_rotated_at,
+            "state_reason": record.state_reason,
             "supports_idempotency": record.supports_idempotency,
             "idempotency_mode": record.idempotency_mode,
         }
@@ -339,8 +352,9 @@ async def get_connector(
 async def create_connector(
     payload: ConnectorCreate,
     session: AsyncSession = Depends(get_session),
-    tenant_id: str = Depends(current_tenant),
+    caller: CallerIdentity = Depends(current_identity),
 ) -> Connector:
+    tenant_id = caller.tenant_id
     if not ADAPTERS.has(payload.kind):
         # Fail at registration, not at first invocation.
         raise HTTPException(
@@ -384,6 +398,26 @@ async def create_connector(
         ) from None
 
     connector = _to_schema(record)
+    # The first audit entry. Without it the trail begins at the first
+    # transition, leaving no record of who placed the connector in its
+    # initial state — which, for a connector created directly as `enabled`,
+    # is the most consequential decision in its life.
+    session.add(
+        ConnectorAuditRecord(
+            id=uuid.uuid4(),
+            connector_id=record.id,
+            tenant_id=tenant_id,
+            # No source state: creation is not a transition. The empty
+            # string is safe as a sentinel because no state is named "" —
+            # `is_executable("")` is False, and is tested to stay that way.
+            from_state="",
+            to_state=record.status,
+            event="connector.created",
+            actor_id=caller.actor_id,
+            reason=None,
+            aggregate_version=record.version,
+        )
+    )
     enqueue(
         session,
         OutboxEvent,
@@ -401,10 +435,51 @@ async def create_connector(
 async def validate_connector(
     connector_id: uuid.UUID,
     session: AsyncSession = Depends(get_session),
-    tenant_id: str = Depends(current_tenant),
+    caller: CallerIdentity = Depends(current_identity),
 ) -> ValidationReport:
-    record = await _tenant_connector(session, connector_id, tenant_id)
+    """Validate the stored configuration and record the outcome as a transition.
+
+    Reporting without transitioning would leave the connector's state saying
+    nothing about whether it had ever passed validation, which is the fact the
+    ENABLE edge depends on. Both outcomes are recorded: success advances
+    CONFIGURED -> VALIDATED, failure re-records CONFIGURED, so an operator can
+    see from the audit trail that validation was attempted and refused.
+
+    The report is returned whatever the connector's state. A connector outside
+    the CONFIGURED/VALIDATED pair can still be checked; only the state change
+    is skipped, since there is no edge to take.
+    """
+    record = await _tenant_connector(session, connector_id, caller.tenant_id)
     report = await ADAPTERS.get(record.kind).validate_config(dict(record.config or {}))
+
+    target = ConnectorState.VALIDATED if report.valid else ConnectorState.CONFIGURED
+    event = (
+        "connector.validation_succeeded"
+        if report.valid
+        else "connector.validation_failed"
+    )
+    try:
+        await tr.apply(
+            session,
+            connector_id=connector_id,
+            target=target,
+            event=event,
+            actor_id=caller.actor_id,
+            tenant_id=caller.tenant_id,
+            reason=None if report.valid else "; ".join(report.errors)[:1024],
+        )
+    except tr.TransitionRejected:
+        # No edge from the current state. The report still stands; the
+        # connector simply is not at a point in its life where validation
+        # changes anything.
+        await session.rollback()
+
+    # Stored so a read reports the same guarantee validation just established.
+    record = await _tenant_connector(session, connector_id, caller.tenant_id)
+    record.supports_idempotency = report.supports_idempotency
+    record.idempotency_mode = report.idempotency_mode.value
+    await session.commit()
+
     return ValidationReport(
         valid=report.valid,
         errors=report.errors,
@@ -489,6 +564,202 @@ async def request_connector_deletion(
     )
     await session.commit()
     return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+# --------------------------------------------------------------------- #
+# lifecycle transitions
+# --------------------------------------------------------------------- #
+#
+# One handler per transition, all routed through `transitions.apply`, so the
+# nine requirements a transition must satisfy — precondition, actor, tenant,
+# version increment, outbox event, audit record, idempotency, reason,
+# policy — are met identically by every endpoint. An endpoint that mutated
+# `status` directly would satisfy some of them and silently skip the rest;
+# that is exactly how the old `enabled` boolean and `deletion_requested`
+# came to disagree.
+
+
+async def _transition(
+    session: AsyncSession,
+    connector_id: uuid.UUID,
+    caller: CallerIdentity,
+    target: ConnectorState,
+    event: str | None,
+    body: TransitionRequest | None,
+) -> Connector:
+    """Apply a transition and translate its refusals into HTTP."""
+    body = body or TransitionRequest()
+    try:
+        result = await tr.apply(
+            session,
+            connector_id=connector_id,
+            target=target,
+            event=event,
+            actor_id=caller.actor_id,
+            tenant_id=caller.tenant_id,
+            reason=body.reason,
+            idempotency_key=body.idempotency_key,
+        )
+    except LookupError:
+        raise HTTPException(status_code=404, detail="Connector not found") from None
+    except tr.ReasonRequired as exc:
+        raise HTTPException(
+            status_code=422,
+            detail={"error_code": "REASON_REQUIRED", "message": str(exc)},
+        ) from None
+    except tr.TransitionRejected as exc:
+        # 409 with the permitted targets: a caller told only "no" has to guess.
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error_code": "TRANSITION_NOT_PERMITTED",
+                "message": str(exc),
+                "current_state": exc.current,
+                "permitted_targets": exc.permitted,
+            },
+        ) from None
+    return _to_schema(result.connector)
+
+
+@app.post("/v1/connectors/{connector_id}/install", response_model=Connector)
+async def install_connector(
+    connector_id: uuid.UUID,
+    body: TransitionRequest | None = None,
+    session: AsyncSession = Depends(get_session),
+    caller: CallerIdentity = Depends(current_identity),
+) -> Connector:
+    return await _transition(
+        session, connector_id, caller, ConnectorState.INSTALLED, None, body
+    )
+
+
+@app.post("/v1/connectors/{connector_id}/configure", response_model=Connector)
+async def configure_connector(
+    connector_id: uuid.UUID,
+    body: TransitionRequest | None = None,
+    session: AsyncSession = Depends(get_session),
+    caller: CallerIdentity = Depends(current_identity),
+) -> Connector:
+    """Reconfiguration always lands in CONFIGURED, so validation must run again."""
+    return await _transition(
+        session,
+        connector_id,
+        caller,
+        ConnectorState.CONFIGURED,
+        "connector.configured",
+        body,
+    )
+
+
+@app.post("/v1/connectors/{connector_id}/enable", response_model=Connector)
+async def enable_connector(
+    connector_id: uuid.UUID,
+    body: TransitionRequest | None = None,
+    session: AsyncSession = Depends(get_session),
+    caller: CallerIdentity = Depends(current_identity),
+) -> Connector:
+    """Only a validated or previously-disabled connector may be enabled."""
+    return await _transition(
+        session, connector_id, caller, ConnectorState.ENABLED, "connector.enabled", body
+    )
+
+
+@app.post("/v1/connectors/{connector_id}/disable", response_model=Connector)
+async def disable_connector(
+    connector_id: uuid.UUID,
+    body: TransitionRequest | None = None,
+    session: AsyncSession = Depends(get_session),
+    caller: CallerIdentity = Depends(current_identity),
+) -> Connector:
+    return await _transition(
+        session,
+        connector_id,
+        caller,
+        ConnectorState.DISABLED,
+        "connector.disabled",
+        body,
+    )
+
+
+@app.post("/v1/connectors/{connector_id}/rotate-credentials", response_model=Connector)
+async def rotate_connector_credentials(
+    connector_id: uuid.UUID,
+    body: TransitionRequest | None = None,
+    session: AsyncSession = Depends(get_session),
+    caller: CallerIdentity = Depends(current_identity),
+) -> Connector:
+    """Records that a secret changed. State is unaffected; the audit is the point."""
+    record = await _tenant_connector(session, connector_id, caller.tenant_id)
+    current = ConnectorState(record.status)
+    return await _transition(
+        session,
+        connector_id,
+        caller,
+        current,
+        "connector.credentials_rotated",
+        body,
+    )
+
+
+@app.post("/v1/connectors/{connector_id}/revoke", response_model=Connector)
+async def revoke_connector(
+    connector_id: uuid.UUID,
+    body: TransitionRequest | None = None,
+    session: AsyncSession = Depends(get_session),
+    caller: CallerIdentity = Depends(current_identity),
+) -> Connector:
+    """Revocation. One-way, reasoned, and effective on the very next invocation.
+
+    There is no cache to invalidate and no consumer to converge: executability
+    is read from this row inside the invoking transaction. The event emitted
+    here informs the rest of the system; it does not enforce anything.
+    """
+    return await _transition(
+        session, connector_id, caller, ConnectorState.REVOKED, "connector.revoked", body
+    )
+
+
+@app.post("/v1/connectors/{connector_id}/archive", response_model=Connector)
+async def archive_connector(
+    connector_id: uuid.UUID,
+    body: TransitionRequest | None = None,
+    session: AsyncSession = Depends(get_session),
+    caller: CallerIdentity = Depends(current_identity),
+) -> Connector:
+    """The normal end state. Identity and audit trail are retained."""
+    return await _transition(
+        session,
+        connector_id,
+        caller,
+        ConnectorState.ARCHIVED,
+        "connector.archived",
+        body,
+    )
+
+
+@app.get("/v1/connectors/{connector_id}/audit", response_model=list[AuditEntry])
+async def connector_audit(
+    connector_id: uuid.UUID,
+    session: AsyncSession = Depends(get_session),
+    tenant_id: str = Depends(current_tenant),
+) -> list[AuditEntry]:
+    """Every transition this connector has undergone, oldest first."""
+    await _tenant_connector(session, connector_id, tenant_id)
+    records = await tr.audit_trail(session, connector_id, tenant_id)
+    return [
+        AuditEntry(
+            id=r.id,
+            connector_id=r.connector_id,
+            from_state=r.from_state,
+            to_state=r.to_state,
+            event=r.event,
+            actor_id=r.actor_id,
+            reason=r.reason,
+            aggregate_version=r.aggregate_version,
+            recorded_at=r.recorded_at,
+        )
+        for r in records
+    ]
 
 
 # --------------------------------------------------------------------- #

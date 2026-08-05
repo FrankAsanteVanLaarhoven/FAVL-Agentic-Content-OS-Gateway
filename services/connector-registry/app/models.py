@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import uuid
 from datetime import UTC, datetime
-from enum import Enum
 from typing import Any
 
 from sqlalchemy import (
@@ -24,37 +23,28 @@ from sqlalchemy.dialects.postgresql import ARRAY, JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
 from .db import Base
+from .lifecycle import ConnectorState, is_executable
 
 
 def _utcnow() -> datetime:
     return datetime.now(UTC)
 
 
-class ConnectorStatus(str, Enum):
-    """The single authoritative lifecycle field.
-
-    A separate `enabled` boolean was removed rather than kept alongside this:
-    two sources of truth for whether a connector may run will eventually
-    disagree, and the disagreement surfaces as a security bug.
-    """
-
-    DRAFT = "draft"
-    ENABLED = "enabled"
-    DISABLED = "disabled"
-    DELETION_REQUESTED = "deletion_requested"
-    DELETED = "deleted"
-
-
-# States in which a connector may accept traffic.
-EXECUTABLE_STATUSES = frozenset({ConnectorStatus.ENABLED})
+# The lifecycle enum lives in `lifecycle.py`, which owns the state machine.
+# This module previously declared its own five-state copy; once the machine
+# grew to ten, the two disagreed about which states exist — the same
+# two-sources-of-truth failure that removing the `enabled` boolean was meant
+# to end, reintroduced under a different name. There is one enum now.
+ConnectorStatus = ConnectorState
 
 
 class ConnectorRecord(Base):
     __tablename__ = "connectors"
     __table_args__ = (
         CheckConstraint(
-            "status IN ('draft', 'enabled', 'disabled', "
-            "'deletion_requested', 'deleted')",
+            "status IN ('draft', 'installed', 'configured', 'validated', "
+            "'enabled', 'disabled', 'revoked', 'deletion_requested', "
+            "'archived', 'deleted')",
             name="ck_connectors_status",
         ),
         CheckConstraint(
@@ -111,6 +101,16 @@ class ConnectorRecord(Base):
         DateTime(timezone=True), nullable=True
     )
     deleted_by: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    revoked_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    archived_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    credentials_rotated_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    state_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         nullable=False,
@@ -120,7 +120,8 @@ class ConnectorRecord(Base):
 
     @property
     def executable(self) -> bool:
-        return self.status in {s.value for s in EXECUTABLE_STATUSES}
+        """Delegates to the state machine. See `lifecycle.is_executable`."""
+        return is_executable(self.status)
 
 
 class InvocationRecord(Base):
@@ -193,6 +194,51 @@ class InvocationRecord(Base):
     )
 
     created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=_utcnow,
+        server_default=func.now(),
+    )
+
+
+class ConnectorAuditRecord(Base):
+    """Immutable record of one lifecycle transition.
+
+    Separate from outbox_events deliberately. An outbox row's retention is a
+    delivery concern and it is pruned once delivered; an audit record must
+    answer "who changed this, when, from what, to what, and why" long after
+    the event has left the stream. The table is append-only at the database
+    level (see migration 0008), so a later code change cannot rewrite it.
+    """
+
+    __tablename__ = "connector_audit"
+    __table_args__ = (
+        # One row per aggregate version: a transition that produced two audit
+        # entries, or none, is a bug the database refuses rather than hides.
+        UniqueConstraint(
+            "connector_id", "aggregate_version", name="uq_connector_audit_version"
+        ),
+        Index("ix_connector_audit_connector", "connector_id", "aggregate_version"),
+        Index("ix_connector_audit_tenant", "tenant_id", "recorded_at"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    connector_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("connectors.id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    tenant_id: Mapped[str] = mapped_column(String(255), nullable=False)
+    from_state: Mapped[str] = mapped_column(String(24), nullable=False)
+    to_state: Mapped[str] = mapped_column(String(24), nullable=False)
+    event: Mapped[str] = mapped_column(String(64), nullable=False)
+    actor_id: Mapped[str] = mapped_column(String(255), nullable=False)
+    reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    aggregate_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    idempotency_key: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    recorded_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         nullable=False,
         default=_utcnow,

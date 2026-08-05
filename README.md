@@ -343,6 +343,61 @@ bash tests/verify_outbox.sh
 It takes several minutes and asserts 15 conditions. It writes test rows into
 the development database, so do not point it at anything you care about.
 
+## Connector lifecycle
+
+A connector is a state machine, not a row with an `enabled` flag. The states
+and the edges between them live in `services/connector-registry/app/lifecycle.py`;
+nothing else is permitted to write `connectors.status`.
+
+```
+draft -> installed -> configured -> validated -> enabled <-> disabled
+                          ^                                    |
+                          +------- reconfigure -----------------+
+
+any live state -> revoked        (one-way, reason required)
+disabled|revoked -> deletion_requested -> archived -> deleted (privileged)
+```
+
+Two rules carry the security weight:
+
+- **Only `enabled` may serve an invocation.** `EXECUTABLE_STATES` is a set of
+  exactly one, so a state added later is non-executable until somebody puts it
+  there deliberately. The check reads the connector row inside the transaction
+  that is about to use it — there is no cache to invalidate.
+- **Revocation is immediate and one-way.** A connector revoked between two
+  requests cannot serve the second. It cannot be re-enabled, only replaced,
+  because restoring it would return a compromised credential to service
+  without rotating it.
+
+Every transition writes an immutable `connector_audit` row — actor, reason,
+from-state, to-state, aggregate version — in the same transaction as the state
+change and the outbox event. The table is append-only at the database level
+via trigger, so a later code change cannot rewrite history, and the connector
+row is FK-protected against deletion out from under its own trail.
+
+```bash
+curl -X POST -H "Authorization: Bearer $TOKEN" \
+  -d '{"reason": "credential suspected compromised"}' \
+  http://localhost:9080/v1/connectors/$ID/revoke
+
+curl -H "Authorization: Bearer $TOKEN" \
+  http://localhost:9080/v1/connectors/$ID/audit
+```
+
+`tests/verify_lifecycle.sh` asserts 41 conditions against the running stack,
+including the one that matters: it revokes a connector **while an invocation
+is in flight** and proves the next call is refused with 403
+`CONNECTOR_REVOKED`. Evidence, and the run where that gate was watched
+failing on purpose, are in `gates/G3/`.
+
+```bash
+make test-lifecycle
+```
+
+Note what it does not assert: an invocation already accepted runs to its
+deadline. Revocation prevents new use; cancelling work in flight is a separate
+decision, tracked as DOC-003 in `docs/DEBT.md`.
+
 ## Observability
 
 Prometheus runs on `http://localhost:9092`. All five scrape targets should

@@ -188,6 +188,110 @@ MUTATIONS: list[Mutation] = [
         replace="    if schema_version is None:\n        return parse_v1_event({**payload, 'event_id': 'x', 'event_type': subject or 'x'})",
         expect_failing="test_legacy_event_is_identified_as_version_zero",
     ),
+    # ---- I12: revocation must prevent new use immediately ----------
+    Mutation(
+        name="make-revoked-executable",
+        invariant="I12",
+        file="services/connector-registry/app/lifecycle.py",
+        find=(
+            "EXECUTABLE_STATES: frozenset[ConnectorState] = "
+            "frozenset({ConnectorState.ENABLED})"
+        ),
+        replace=(
+            "EXECUTABLE_STATES: frozenset[ConnectorState] = frozenset(\n"
+            "    {ConnectorState.ENABLED, ConnectorState.REVOKED}\n)"
+        ),
+        expect_failing="test_revoked_cannot_serve",
+    ),
+    Mutation(
+        name="admit-unknown-states",
+        invariant="I12",
+        file="services/connector-registry/app/lifecycle.py",
+        find="        # An unrecognised state is not executable. A schema migration that\n"
+        "        # introduces one must not accidentally open the gate.\n"
+        "        return False",
+        replace="        return True",
+        expect_failing="test_an_unknown_state_is_not_executable",
+    ),
+    Mutation(
+        name="consult-refusal-map-before-the-guard",
+        invariant="I12",
+        file="services/connector-registry/app/invocations.py",
+        find="    if is_executable(status):\n        return",
+        replace="    if status not in _REFUSAL:\n        return",
+        expect_failing="test_an_unmapped_state_is_refused_not_admitted",
+    ),
+    Mutation(
+        name="allow-enable-without-validation",
+        invariant="I12",
+        file="services/connector-registry/app/lifecycle.py",
+        find=(
+            "    Transition(ConnectorState.VALIDATED, ConnectorState.ENABLED, "
+            '"connector.enabled"),'
+        ),
+        replace=(
+            "    Transition(ConnectorState.VALIDATED, ConnectorState.ENABLED, "
+            '"connector.enabled"),\n'
+            "    Transition(ConnectorState.CONFIGURED, ConnectorState.ENABLED, "
+            '"connector.enabled"),'
+        ),
+        expect_failing="test_a_connector_must_be_validated_before_it_can_be_enabled",
+    ),
+    Mutation(
+        name="allow-revoked-to-be-re-enabled",
+        invariant="I12",
+        file="services/connector-registry/app/lifecycle.py",
+        find=(
+            "    Transition(\n"
+            "        ConnectorState.ARCHIVED,\n"
+            "        ConnectorState.DELETED,"
+        ),
+        replace=(
+            "    Transition(\n"
+            "        ConnectorState.REVOKED, ConnectorState.ENABLED, "
+            '"connector.enabled"\n'
+            "    ),\n"
+            "    Transition(\n"
+            "        ConnectorState.ARCHIVED,\n"
+            "        ConnectorState.DELETED,"
+        ),
+        expect_failing="test_revocation_is_one_way",
+    ),
+    Mutation(
+        name="drop-the-reason-requirement-on-revocation",
+        invariant="I12",
+        file="services/connector-registry/app/lifecycle.py",
+        find="            idempotent=True,\n            requires_reason=True,\n        )\n"
+        "        for source in (",
+        replace="            idempotent=True,\n        )\n        for source in (",
+        expect_failing="test_every_revocation_and_suspension_demands_a_reason",
+    ),
+    Mutation(
+        name="let-creation-skip-the-machine",
+        invariant="I12",
+        file="services/connector-registry/app/lifecycle.py",
+        find="CREATABLE_STATES: frozenset[ConnectorState] = frozenset(\n    {\n"
+        "        ConnectorState.DRAFT,",
+        replace="CREATABLE_STATES: frozenset[ConnectorState] = frozenset(\n    {\n"
+        "        ConnectorState.REVOKED,\n"
+        "        ConnectorState.ARCHIVED,\n"
+        "        ConnectorState.DRAFT,",
+        expect_failing="test_creation_cannot_enter_a_guarded_state",
+    ),
+    Mutation(
+        name="look-for-a-self-loop-instead-of-an-incoming-edge",
+        invariant="I12",
+        file="services/connector-registry/app/lifecycle.py",
+        find="        if transition.target.value == target and transition.idempotent:",
+        replace=(
+            "        if (\n"
+            "            transition.source.value == target\n"
+            "            and transition.target.value == target\n"
+            "            and transition.idempotent\n"
+            "        ):"
+        ),
+        expect_failing="test_every_idempotent_target_resolves",
+    ),
 ]
 
 
