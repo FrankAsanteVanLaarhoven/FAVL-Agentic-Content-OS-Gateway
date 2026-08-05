@@ -315,6 +315,14 @@ Enforced by `services/connector-registry/app/lifecycle.py` and the guard in
 `invocations.check_executable`. Guarded by `tests/test_lifecycle.py` (33
 tests) and by eight mutations in `scripts/mutate.py`.
 
+**Scope.** "New use" means exactly that. What happens to an invocation already
+running is settled separately in ADR 0002: standard revocation lets it finish
+under the authority snapshot pinned at acceptance; emergency revocation (not
+yet implemented) requests cancellation. The platform does not claim to cancel
+provider-side work already accepted remotely. Do not restate I12 as
+"revocation stops all activity" — it does not, and the narrower claim is the
+one that survives an incident review.
+
 **Failure observed** — twice, and neither by the unit tests.
 
 `tests/verify_lifecycle.sh` section 3 revokes a connector while an invocation
@@ -349,7 +357,9 @@ needs a superseding ADR, not a code comment.
 | Secrets resolve from environment variables | Names are derived, never caller-supplied; scoped by owner | M1.7 |
 | No tenant administration; tenant comes from one user attribute | Claim is IdP-issued and unforgeable through the gateway | M3 |
 | Agents may reference a connector id from another tenant at creation | Invocation is refused at fan-out; only the reference is permitted | M1.5 |
-| An in-flight invocation completes after its connector is revoked | Revocation blocks new use; work already accepted runs to its deadline. Reported by `verify_lifecycle.sh`, not asserted as a requirement | open — needs a decision, not a fix |
+| Provider-side work already accepted remotely cannot be cancelled | None possible. The guarantee is scoped to authorisation, not to remote execution; ADR 0002 states it explicitly rather than implying more | permanent — accepted |
+| Emergency revocation is specified but not built | Standard revocation is implemented and gated; the emergency path is designed in ADR 0002, tracked as REV-001..003 | M1.5 |
+| The redirect loop re-checks addresses but not revocation | Correct under standard revocation (running work finishes); a gap only for the unbuilt emergency mode | with REV-003 |
 | Physical deletion (`archived -> deleted`) has no endpoint | The transition is defined and privileged; nothing can reach it yet | M1.5 |
 | Rolling back migration 0008 destroys the audit trail | Documented in the migration; dump `connector_audit` before downgrading | accepted |
 | A config change can sit undeployed | `verify_alerts.sh` compares the running rule set against the file; `--web.enable-lifecycle` makes reload possible | closed |

@@ -394,9 +394,21 @@ failing on purpose, are in `gates/G3/`.
 make test-lifecycle
 ```
 
-Note what it does not assert: an invocation already accepted runs to its
-deadline. Revocation prevents new use; cancelling work in flight is a separate
-decision, tracked as DOC-003 in `docs/DEBT.md`.
+Revocation blocks new use. An invocation already accepted runs to completion
+under the authority snapshot pinned when it was accepted — that is the
+decision, not an oversight, and `verify_lifecycle.sh` asserts it. The
+reasoning, the emergency-revocation design that is **not yet built**, and the
+limits of what the platform can honestly promise are in
+`docs/adr/0002-connector-revocation-semantics.md`.
+
+The guarantee is deliberately narrow:
+
+> The platform ceases authorising further connector actions as soon as the
+> revocation becomes authoritative.
+
+Not "all activity stops". Provider-side work already accepted remotely is not
+ours to cancel, and claiming otherwise would mislead exactly the operator who
+most needs the truth.
 
 ## Observability
 

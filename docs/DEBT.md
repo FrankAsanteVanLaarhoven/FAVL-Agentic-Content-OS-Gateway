@@ -101,27 +101,70 @@ every other artefact:
 why the static check is sufficient.
 
 
-## DOC-003 — In-flight invocations survive revocation
+## DOC-003 — In-flight invocations survive revocation — **CLOSED 2026-08-05**
+
+Resolved by `docs/adr/0002-connector-revocation-semantics.md`. Standard
+revocation blocks new and queued work and lets running invocations finish
+under the authority snapshot pinned at acceptance; emergency revocation is a
+separate operation. `verify_lifecycle.sh` §3 now asserts the chosen behaviour
+instead of reporting it, which was this item's completion criterion.
+
+The three implementation items the decision created are below. They are
+tracked as debt rather than left inside the ADR, because a design recorded in
+a document nobody re-reads is indistinguishable from a design nobody built.
+
+## REV-001 — "Cancel queued invocations" is vacuous until execution is async
 
 **Owner:** Frank Asante Van Laarhoven
-**Blocks:** nothing yet; needs a decision before a customer asks
+**Blocks:** the first asynchronous execution path — not before
 **Raised:** 2026-08-05
 
-Revoking a connector prevents new use immediately (I12, gated by
-`verify_lifecycle.sh` section 3). An invocation already accepted runs to its
-deadline — up to 300 s. `verify_lifecycle.sh` reports that outcome rather than
-asserting it, because asserting either way would imply a decision nobody has
-made.
+ADR 0002 requires standard revocation to cancel queued invocations. Today
+`accept()` commits `ACCEPTED` and `execute()` sets `RUNNING` inside the same
+request, so there is no queue and no actor positioned to cancel anything. The
+clause is not satisfied — there is nothing for it to be satisfied *by*.
 
-The two defensible answers are different products:
+This is the dangerous kind of debt: the requirement reads as met because
+nothing violates it, and it becomes load-bearing at precisely the moment
+someone is busy building a worker pool.
 
-- **Accepted work completes.** Simple, and matches how most credentials
-  behave — a revoked API key does not kill sessions already authenticated.
-- **Revocation cancels in flight.** Correct if revocation means "this
-  credential is compromised *now*", which is the reason the reason field
-  exists.
+**Done when:** either an asynchronous path exists and cancels `ACCEPTED`
+invocations on revocation, with a live test that revokes between accept and
+start and asserts the invocation never runs; or the ADR is amended to say the
+clause is deliberately deferred, with the date.
 
-**Done when:** the choice is recorded in ADR 0001 with its rationale, and
-`verify_lifecycle.sh` asserts the chosen behaviour instead of reporting it.
-Until then the residual-risk row stays open, and nobody should claim
-revocation is instantaneous without the qualifier.
+## REV-002 — Automatic retry would silently falsify a stated guarantee
+
+**Owner:** Frank Asante Van Laarhoven
+**Blocks:** any automatic retry of invocations
+**Raised:** 2026-08-05
+
+ADR 0002 states that credentials are unavailable for subsequent retries. That
+holds today only because no retry path exists: `attempt` is always 1, and a
+caller retrying issues a new invocation that passes through
+`check_executable`. The property rests on an architectural absence, not a
+control — add an internal retry loop and the sentence becomes false with no
+test going red.
+
+**Done when:** any retry implementation re-checks revocation before resolving
+secrets, and a mutation removing that check kills a named test. Until then,
+this item is the tripwire.
+
+## REV-003 — The redirect loop has no revocation checkpoint
+
+**Owner:** Frank Asante Van Laarhoven
+**Blocks:** emergency revocation
+**Raised:** 2026-08-05
+
+`security/outbound.request` follows redirects in a loop, revalidating the
+destination address at every hop (I3) but never re-checking whether the
+connector is still authorised. It is the only genuine multi-hop path in the
+system.
+
+Under standard revocation this is **correct** — the invocation is running, and
+running work finishes. It is a gap only for the emergency mode.
+
+**Done when:** emergency revocation exists and the redirect loop consults it
+before each hop, or the loop is documented as out of scope with the reason.
+Do not "fix" this before emergency revocation exists: adding a check that
+nothing can trigger is untested code guarding an unreachable state.
