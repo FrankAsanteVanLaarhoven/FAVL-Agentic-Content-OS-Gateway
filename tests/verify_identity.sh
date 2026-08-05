@@ -37,14 +37,31 @@ check() {
 
 echo "== identity is derived from the verified token, not from headers =="
 
-RESULT=$($DC exec -T orchestrator python - <<'PY'
+# The development realm has one user and therefore one tenant, so the other
+# side of the boundary has to be created directly. This connector is owned by
+# `victim-tenant` and must be unreachable by the demo user through every path.
+PLANTED=$(cat /proc/sys/kernel/random/uuid)
+$DC exec -T postgres psql -U favl -d favl_connectors -q -c \
+  "INSERT INTO connectors (id, tenant_id, name, kind, base_url, scopes, config,
+     status, version, supports_idempotency, idempotency_mode, created_at)
+   VALUES ('$PLANTED', 'victim-tenant', 'victim-${PLANTED:0:8}', 'http',
+     'http://testprovider:9099', '{}',
+     '{\"base_url\": \"http://testprovider:9099\", \"allowed_hosts\": [\"testprovider\"]}'::jsonb,
+     'enabled', 1, false, 'unsupported', now())" >/dev/null
+
+RESULT=$($DC exec -T orchestrator python - "$PLANTED" <<'PY'
 import asyncio
 import base64
 import json
 
+import sys
+import uuid as _uuid
+
 import httpx
 
 KC = "http://keycloak:8080/realms/favl/protocol/openid-connect/token"
+
+
 GW = "http://apisix:9080"
 
 
@@ -118,10 +135,44 @@ async def main() -> None:
         # the number of distinct tenants.
         foreign = [row for row in rows if row.get("tenant_id") != my_tenant]
         print(f"foreign_invocation_rows={len(foreign)}")
-        foreign_conns = [
-            item for item in conns if item.get("tenant_id", my_tenant) != my_tenant
-        ]
-        print(f"foreign_connector_rows={len(foreign_conns)}")
+        # Positive control. A connector planted directly in another tenant
+        # must be invisible to the listing, un-fetchable by id, and — the
+        # bypass that mattered — un-invokable through an agent fan-out.
+        planted = sys.argv[1]
+        print(f"planted_connector={planted[:8]}")
+
+        visible = [item for item in conns if item["id"] == planted]
+        print(f"foreign_connector_visible={len(visible)}")
+
+        r = await c.get(f"{GW}/v1/connectors/{planted}", headers=auth)
+        print(f"foreign_connector_direct={r.status_code}")
+
+        agent = await c.post(
+            f"{GW}/v1/agents",
+            headers=auth,
+            json={"name": f"xt-{_uuid.uuid4().hex[:8]}", "connector_ids": [planted]},
+        )
+        print(f"cross_tenant_agent_create={agent.status_code}")
+        if agent.status_code == 201:
+            inv = await c.post(
+                f"{GW}/v1/agents/{agent.json()['id']}/invoke",
+                headers=auth,
+                json={"probe": 1},
+            )
+            outputs = inv.json().get("outputs", []) if inv.status_code == 200 else []
+            # The registry must REFUSE with 404 (connector not found for this
+            # tenant). Any other outcome means the invocation reached the
+            # adapter and an outbound call was made on the victim's behalf —
+            # including a provider error, which still proves reachability.
+            # Asserting on status == "completed" was the earlier mistake: the
+            # bypass produced UPSTREAM_CLIENT_ERROR/502, never "completed",
+            # so the check passed while the bypass worked.
+            reached = [o for o in outputs if o.get("http_status") != 404]
+            print(f"cross_tenant_agent_reached={len(reached)}")
+            print(f"cross_tenant_outputs={len(outputs)}")
+        else:
+            print("cross_tenant_agent_reached=0")
+            print("cross_tenant_outputs=0")
 
         # Rows belonging to any other tenant must be invisible. The database
         # is seeded with rows under a different tenant by earlier runs.
@@ -158,6 +209,7 @@ if [ -z "$(echo "$RESULT" | tr -d '[:space:]')" ]; then
 fi
 
 check "forged X-Userinfo leaks no other-tenant rows" "$(get forged_leaked_rows)" "0"
+check "forged X-Userinfo does not elevate the request" "$(get forged_status)" "200"
 check "unauthenticated read is rejected at the gateway" "$(get anonymous_status)" "401"
 check "authenticated read succeeds" "$(get authenticated_status)" "200"
 
@@ -165,7 +217,10 @@ check "unknown connector id returns 404, not 403" "$(get foreign_connector_get)"
 check "connector listing is tenant-scoped" "$(get connector_list_status)" "200"
 check "tenant comes from a token claim, not a default" "$(get token_tenant)" "favl-demo"
 check "no visible invocation belongs to another tenant" "$(get foreign_invocation_rows)" "0"
-check "no visible connector belongs to another tenant" "$(get foreign_connector_rows)" "0"
+check "a foreign connector is absent from the listing" "$(get foreign_connector_visible)" "0"
+check "a foreign connector id returns 404" "$(get foreign_connector_direct)" "404"
+check "an agent's fan-out never reaches a foreign connector" "$(get cross_tenant_agent_reached)" "0"
+check "the fan-out actually attempted the connector" "$(get cross_tenant_outputs)" "1"
 check "creating a connector succeeds under that tenant" "$(get scoped_create_status)" "201"
 check "only the caller's own new row becomes visible" "$(get visible_grew_by)" "1"
 

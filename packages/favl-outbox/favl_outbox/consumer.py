@@ -33,10 +33,27 @@ SCHEMA_REJECTED = Counter(
 )
 
 
-class UnsupportedSchemaVersion(ValueError):
+class EventParseError(ValueError):
+    """Base for every rejection this module raises.
+
+    A consumer catches this one type. Previously a malformed v1 envelope
+    raised a bare KeyError, which escaped `except UnsupportedSchemaVersion`,
+    killed the message handler, and left favl_event_schema_rejected_total —
+    the counter whose whole purpose is to make dropped events visible —
+    untouched.
+    """
+
+
+class UnsupportedSchemaVersion(EventParseError):
     def __init__(self, version: Any) -> None:
         super().__init__(f"unsupported event schema_version: {version!r}")
         self.version = version
+
+
+class MalformedEnvelope(EventParseError):
+    def __init__(self, missing: str) -> None:
+        super().__init__(f"v1 envelope is missing required field: {missing}")
+        self.missing = missing
 
 
 @dataclass(frozen=True)
@@ -100,6 +117,10 @@ def parse_legacy_event(
 
 
 def parse_v1_event(payload: dict[str, Any]) -> DomainEvent:
+    for required in ("event_id", "event_type"):
+        if not payload.get(required):
+            SCHEMA_REJECTED.labels("malformed_envelope").inc()
+            raise MalformedEnvelope(required)
     SCHEMA_PROCESSED.labels("1").inc()
     return DomainEvent(
         event_id=payload["event_id"],

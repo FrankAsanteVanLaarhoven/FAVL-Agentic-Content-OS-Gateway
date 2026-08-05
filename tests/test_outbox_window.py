@@ -130,3 +130,53 @@ def test_shrinking_the_window_via_environment_is_caught(monkeypatch):
 def test_environment_is_restored_after_drift_tests():
     assert "OUTBOX_MAX_ATTEMPTS" not in os.environ
     cfg.enforce_duplicate_window_invariant("test")
+
+
+def test_dead_letter_limit_matches_the_gated_policy():
+    """The gate and the runtime must use the same attempt count.
+
+    The invariant is proved from retry_policy.max_attempts. If the publisher
+    dead-lettered on the row's stored column instead, an operator could set
+    OUTBOX_MAX_ATTEMPTS=1, watch the gate pass with a 76s horizon, and still
+    have rows retry eight times for a real horizon of 766s — outside a window
+    the gate certified as safe.
+    """
+    import sys
+    from dataclasses import dataclass, field
+    from datetime import UTC, datetime
+    from pathlib import Path
+
+    sys.path.insert(
+        0, str(Path(__file__).resolve().parents[1] / "packages" / "favl-outbox")
+    )
+    from favl_outbox.publisher import DrainResult, OutboxPublisher
+    from favl_outbox.timing import RetryPolicy
+
+    @dataclass
+    class Row:
+        subject: str = "agent.created"
+        attempts: int = 0
+        # The DB default, deliberately larger than the policy.
+        max_attempts: int = 8
+        status: str = "pending"
+        last_error: str | None = None
+        next_attempt_at: datetime = field(default_factory=lambda: datetime.now(UTC))
+        id: str = "00000000-0000-0000-0000-000000000001"
+
+    publisher = OutboxPublisher(
+        service="test",
+        session_factory=None,
+        model=None,
+        connection=None,
+        retry_policy=RetryPolicy(
+            max_attempts=2, base_seconds=1.0, cap_seconds=300.0, jitter_ratio=0.25
+        ),
+    )
+    row = Row()
+    result = DrainResult()
+    publisher._record_failure(row, ConnectionError("down"), result)
+    assert row.status == "pending"
+    publisher._record_failure(row, ConnectionError("down"), result)
+    # Dead at the POLICY limit of 2, not the column's 8.
+    assert row.status == "dead", "publisher ignored the gated max_attempts"
+    assert row.attempts == 2

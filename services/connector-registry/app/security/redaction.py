@@ -38,30 +38,66 @@ def _is_reference(value: Any) -> bool:
     return isinstance(value, str) and value.startswith(REFERENCE_PREFIXES)
 
 
-def redact_value(key: str, value: Any) -> Any:
+# Keys that are structural rather than sensitive. Everything else that is a
+# plain string is redacted, because a denylist of sensitive names can always
+# be walked around: `{"auth": {"value": "..."}}` hides a credential under an
+# innocuous leaf name, and only the PARENT is suspicious.
+STRUCTURAL_KEYS = frozenset(
+    {
+        "base_url",
+        "target_url",
+        "health_url",
+        "allowed_hosts",
+        "allowed_schemes",
+        "allowed_content_types",
+        "service",
+        "operation",
+        "method",
+        "health_method",
+        "path",
+        "kind",
+        "max_redirects",
+        "max_response_bytes",
+        "connect_timeout",
+        "read_timeout",
+        "timeout_seconds",
+        "idempotency_header",
+        "signing_secret_ref",
+    }
+)
+
+
+def redact_value(key: str, value: Any, *, parent_sensitive: bool = False) -> Any:
     if _is_reference(value):
         return value
-    if SENSITIVE_KEY.search(key):
+    if parent_sensitive or SENSITIVE_KEY.search(key):
         return REDACTED
-    return value
+    # Non-string scalars cannot carry a credential.
+    if not isinstance(value, str):
+        return value
+    # Allowlist: an unrecognised string key is redacted rather than published.
+    if key.lower() in STRUCTURAL_KEYS:
+        return value
+    return REDACTED
 
 
 def _redact_headers(headers: dict[str, Any]) -> dict[str, Any]:
+    """Header NAMES stay visible; literal VALUES never do.
+
+    A denylist of known-credential header names does not work: `X-Telemetry`
+    is not on any list and can carry a bearer token just as well as
+    `Authorization`. Since a legitimate secret is required to be a reference
+    anyway, any literal value here is either non-sensitive (and no loss to
+    hide) or a credential (and must be hidden). The names remain, so the
+    configuration is still auditable.
+    """
     return {
-        header: (
-            header_value
-            if _is_reference(header_value)
-            else (
-                REDACTED
-                if SENSITIVE_HEADER.match(header) or SENSITIVE_KEY.search(header)
-                else header_value
-            )
-        )
-        for header, header_value in headers.items()
+        str(header): (value if _is_reference(value) else REDACTED)
+        for header, value in headers.items()
     }
 
 
-def _redact_any(key: str, value: Any) -> Any:
+def _redact_any(key: str, value: Any, *, parent_sensitive: bool = False) -> Any:
     """Redact a value of any shape, carrying the key's sensitivity inward.
 
     Lists were previously returned untouched, so a credential nested inside
@@ -69,23 +105,28 @@ def _redact_any(key: str, value: Any) -> Any:
     the API and to NATS. Top-level key validation does not see it either,
     because it only intersects the outermost key names.
     """
+    sensitive = parent_sensitive or bool(SENSITIVE_KEY.search(key))
     if isinstance(value, dict):
         if key.lower() == "headers":
             return _redact_headers(value)
-        return redact_config(value)
+        # Sensitivity is inherited: {"auth": {"value": "..."}} must redact the
+        # leaf even though "value" is an innocuous name.
+        return redact_config(value, parent_sensitive=sensitive)
     if isinstance(value, list | tuple):
-        # A sensitive key makes every element sensitive: {"tokens": [...]}.
-        if SENSITIVE_KEY.search(key):
-            return [REDACTED if not _is_reference(item) else item for item in value]
-        return [_redact_any(key, item) for item in value]
-    return redact_value(key, value)
+        return [_redact_any(key, item, parent_sensitive=sensitive) for item in value]
+    return redact_value(key, value, parent_sensitive=sensitive)
 
 
-def redact_config(config: dict[str, Any]) -> dict[str, Any]:
+def redact_config(
+    config: dict[str, Any], *, parent_sensitive: bool = False
+) -> dict[str, Any]:
     """Deep-redact a connector configuration for publication.
 
     Recurses through dicts AND lists. Anything leaving the service passes
     through here, so a credential that slipped past edge validation is never
     republished.
     """
-    return {key: _redact_any(key, value) for key, value in config.items()}
+    return {
+        str(key): _redact_any(str(key), value, parent_sensitive=parent_sensitive)
+        for key, value in config.items()
+    }

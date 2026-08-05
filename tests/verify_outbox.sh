@@ -42,20 +42,58 @@ check() { # check <label> <actual> <expected>
 
 banner() { printf '\n== %s ==\n' "$1"; }
 
+# Sections run back to back; a restart from the previous one can still be in
+# flight. Waiting on readiness keeps a 503 from being reported as a failure
+# of the property under test.
+await_ready() {
+  local deadline=$((SECONDS + ${1:-60}))
+  while [ $SECONDS -lt $deadline ]; do
+    if [ "$(curl -s -o /dev/null -w '%{http_code}' http://localhost:9080/health/ready)" = "200" ]; then
+      return 0
+    fi
+    sleep 2
+  done
+  echo "  ERROR harness: orchestrator did not become ready" >&2
+  return 1
+}
+
 # --------------------------------------------------------------------------
 banner "1/6  crash between commit and publish loses no event"
 # --------------------------------------------------------------------------
 OUTBOX_PUBLISHER_ENABLED=false $DC up -d --no-deps orchestrator >/dev/null 2>&1
 sleep 10
+await_ready 90 || true
 JS_BEFORE=$(js_count)
 RUN="c1$(date +%s)"
 $DC exec -T connector-registry python - "$RUN" <<'PY'
 import asyncio, sys, httpx
 RUN = sys.argv[1]
+KC = "http://keycloak:8080/realms/favl/protocol/openid-connect/token"
+# Calls go through APISIX, not straight to the service. The orchestrator now
+# derives tenant and actor from gateway-verified claims and fails closed
+# without them, so a direct call is a 401 by design.
+GW = "http://apisix:9080"
+
+
+async def bearer(c: httpx.AsyncClient) -> dict[str, str]:
+    r = await c.post(
+        KC,
+        data={
+            "client_id": "agentic-content-os",
+            "client_secret": "replace-me",
+            "username": "demo",
+            "password": "demo-password",
+            "grant_type": "password",
+        },
+    )
+    return {"Authorization": f"Bearer {r.json()['access_token']}"}
+
+
 async def main():
     async with httpx.AsyncClient(timeout=20) as c:
+        auth = await bearer(c)
         for i in range(50):
-            await c.post("http://orchestrator:8000/v1/agents",
+            await c.post(f"{GW}/v1/agents", headers=auth,
                          json={"name": f"{RUN}-{i:03d}", "connector_ids": []})
 asyncio.run(main())
 PY
@@ -103,13 +141,36 @@ check "stream count unchanged after 10 republished ids" "$(js_count)" "$JS_BEFOR
 # --------------------------------------------------------------------------
 banner "4/6  publish failure does not roll back the accepted write"
 # --------------------------------------------------------------------------
+await_ready 90
 $DC stop nats >/dev/null 2>&1
 sleep 3
 CODE=$($DC exec -T connector-registry python - <<'PY'
 import asyncio, httpx, uuid
+KC = "http://keycloak:8080/realms/favl/protocol/openid-connect/token"
+# Calls go through APISIX, not straight to the service. The orchestrator now
+# derives tenant and actor from gateway-verified claims and fails closed
+# without them, so a direct call is a 401 by design.
+GW = "http://apisix:9080"
+
+
+async def bearer(c: httpx.AsyncClient) -> dict[str, str]:
+    r = await c.post(
+        KC,
+        data={
+            "client_id": "agentic-content-os",
+            "client_secret": "replace-me",
+            "username": "demo",
+            "password": "demo-password",
+            "grant_type": "password",
+        },
+    )
+    return {"Authorization": f"Bearer {r.json()['access_token']}"}
+
+
 async def main():
     async with httpx.AsyncClient(timeout=30) as c:
-        r = await c.post("http://orchestrator:8000/v1/agents",
+        auth = await bearer(c)
+        r = await c.post(f"{GW}/v1/agents", headers=auth,
                          json={"name": f"outage-{uuid.uuid4().hex[:8]}", "connector_ids": []})
         print(r.status_code)
 asyncio.run(main())
@@ -148,47 +209,102 @@ psql_orch "DELETE FROM outbox_events WHERE aggregate_id='poison'" >/dev/null
 # --------------------------------------------------------------------------
 banner "6/6  hard crashes during load lose and duplicate nothing"
 # --------------------------------------------------------------------------
+await_ready 90
 RUN="kc$(date +%s)"
+# Resolve the container from compose rather than hardcoding the project
+# name: with COMPOSE_PROJECT_NAME set, every kill would silently no-op
+# and the section would still report green on a run with no crashes.
+ORCH_ID=$($DC ps -q orchestrator)
+KILL_LOG=$(mktemp)
 ( for i in 1 2 3 4; do
-    sleep 7
-    docker kill -s KILL deploy-orchestrator-1 >/dev/null 2>&1 && echo "  [killer] SIGKILL #$i" >&2
+    sleep 13
+    if docker kill -s KILL "$ORCH_ID" >/dev/null 2>&1; then
+      echo kill >> "$KILL_LOG"
+      echo "  [killer] SIGKILL #$i" >&2
+    fi
     sleep 1
-    docker start deploy-orchestrator-1 >/dev/null 2>&1
+    docker start "$ORCH_ID" >/dev/null 2>&1
   done ) &
 KILLER=$!
-timeout 220 $DC exec -T connector-registry python - "$RUN" <<'PY'
+LOAD=$(timeout 600 $DC exec -T connector-registry python - "$RUN" <<'PY'
 import asyncio, sys, httpx
-RUN = sys.argv[1]; TOTAL, CONC = 300, 8
+# The gateway rate-limits /v1/agents* to 300 per 60s per source address, and
+# every request here comes from one container. The driver therefore paces
+# itself and honours 429 rather than counting a throttled request as a lost
+# write — the property under test is delivery across crashes, not throughput.
+RUN = sys.argv[1]
+TOTAL, CONC = 150, 4
+RATE_LIMIT_BACKOFF = 5.0
 accepted = set()
-async def one(c, i, sem):
+KC = "http://keycloak:8080/realms/favl/protocol/openid-connect/token"
+# Calls go through APISIX, not straight to the service. The orchestrator now
+# derives tenant and actor from gateway-verified claims and fails closed
+# without them, so a direct call is a 401 by design.
+GW = "http://apisix:9080"
+
+
+async def bearer(c: httpx.AsyncClient) -> dict[str, str]:
+    r = await c.post(
+        KC,
+        data={
+            "client_id": "agentic-content-os",
+            "client_secret": "replace-me",
+            "username": "demo",
+            "password": "demo-password",
+            "grant_type": "password",
+        },
+    )
+    return {"Authorization": f"Bearer {r.json()['access_token']}"}
+
+
+async def one(c, auth, i, sem):
     name = f"{RUN}-{i:04d}"
     async with sem:
-        await asyncio.sleep(i * 0.05 / CONC)
-        for _ in range(80):
+        # Stagger so the aggregate rate stays under the gateway's budget.
+        await asyncio.sleep(i * 0.4)
+        for _ in range(120):
             try:
-                r = await c.post("http://orchestrator:8000/v1/agents",
+                r = await c.post(f"{GW}/v1/agents", headers=auth,
                                  json={"name": name, "connector_ids": []})
                 if r.status_code in (201, 409):   # 409 == a prior attempt committed
                     accepted.add(name); return
+                if r.status_code == 429:
+                    await asyncio.sleep(RATE_LIMIT_BACKOFF)
+                    continue
             except Exception:
                 pass
             await asyncio.sleep(0.3)
 async def main():
     sem = asyncio.Semaphore(CONC)
-    async with httpx.AsyncClient(timeout=5) as c:
-        await asyncio.gather(*(one(c, i, sem) for i in range(TOTAL)))
+    async with httpx.AsyncClient(timeout=8) as c:
+        auth = await bearer(c)
+        await asyncio.gather(*(one(c, auth, i, sem) for i in range(TOTAL)))
+    # The count is emitted so the assertions can compare against what was
+    # actually accepted. The invariant under test is the EQUALITY between
+    # accepted writes and delivered events; asserting a hard-coded 300
+    # made the section fail whenever the gateway throttled or a restart
+    # window swallowed a request, which says nothing about delivery.
+    print(f"accepted={len(accepted)}")
     print(f"  accepted {len(accepted)}/{TOTAL}")
 asyncio.run(main())
 PY
+)
+echo "$LOAD" | sed 's/^/    /'
 wait $KILLER 2>/dev/null
 docker start deploy-orchestrator-1 >/dev/null 2>&1
 drain 30
+ACCEPTED=$(echo "$LOAD" | tr -d '\r' | sed -n 's/^[[:space:]]*accepted=\([0-9]\+\).*/\1/p' | tail -1)
+KILLS=$(wc -l < "$KILL_LOG" 2>/dev/null || echo 0)
+
+check "the orchestrator was hard-killed four times" "$KILLS" "4"
+check "the load phase accepted a meaningful number of writes" \
+  "$([ "${ACCEPTED:-0}" -ge 120 ] && echo yes || echo no)" "yes"
 check "every accepted write committed" \
-  "$(psql_orch "SELECT count(*) FROM agents WHERE name LIKE '$RUN-%'")" "300"
+  "$(psql_orch "SELECT count(*) FROM agents WHERE name LIKE '$RUN-%'")" "$ACCEPTED"
 check "every committed write produced an event" \
-  "$(psql_orch "SELECT count(*) FROM outbox_events WHERE payload->>'name' LIKE '$RUN-%'")" "300"
+  "$(psql_orch "SELECT count(*) FROM outbox_events WHERE payload->>'name' LIKE '$RUN-%'")" "$ACCEPTED"
 check "every event was delivered" \
-  "$(psql_orch "SELECT count(*) FROM outbox_events WHERE payload->>'name' LIKE '$RUN-%' AND status='published'")" "300"
+  "$(psql_orch "SELECT count(*) FROM outbox_events WHERE payload->>'name' LIKE '$RUN-%' AND status='published'")" "$ACCEPTED"
 check "no agent produced two events" \
   "$(psql_orch "SELECT count(*) FROM (SELECT payload->>'name' FROM outbox_events WHERE payload->>'name' LIKE '$RUN-%' GROUP BY 1 HAVING count(*)>1) x")" "0"
 

@@ -14,6 +14,7 @@ the internal network. A destination must never be able to vouch for itself.
 
 from __future__ import annotations
 
+import math
 import os
 from typing import Any
 
@@ -141,12 +142,44 @@ def build_policy(config: dict[str, Any], *, max_redirects: int = 3) -> OutboundP
 
 
 def _positive_int(value: Any) -> int | None:
-    """Parse a caller-supplied bound, ignoring anything nonsensical."""
+    """Parse a caller-supplied bound, ignoring anything nonsensical.
+
+    OverflowError is caught explicitly: JSON accepts the bare `Infinity`
+    literal, and int(float("inf")) raises it, which previously escaped
+    validate_config and 500'd connector creation.
+    """
     try:
+        if isinstance(value, float) and not math.isfinite(value):
+            return None
         parsed = int(value)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return None
     return parsed if parsed >= 0 else None
+
+
+# Ceilings for the values that decide how long a socket, a task and a
+# connection-pool slot are held. These are NOT in OutboundPolicy because the
+# adapters read them per request, so they are clamped here and nowhere else.
+def timeout_ceiling() -> float:
+    return float(os.getenv("OUTBOUND_TIMEOUT_CEILING", "300"))
+
+
+def clamp_timeout(value: Any, default: float) -> float:
+    """Clamp a caller-supplied timeout to a finite, bounded number.
+
+    `min(nan, x)` returns nan in Python, so a config carrying
+    `"read_timeout": "nan"` produced httpx.Timeout(read=nan) — a request that
+    never returns, pinning a task and a pool slot forever. A non-finite or
+    unparsable value falls back to the default rather than propagating.
+    """
+    ceiling = timeout_ceiling()
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return min(default, ceiling)
+    if not math.isfinite(parsed) or parsed <= 0:
+        return min(default, ceiling)
+    return min(parsed, ceiling)
 
 
 def rejected_operator_keys(config: dict[str, Any]) -> list[str]:

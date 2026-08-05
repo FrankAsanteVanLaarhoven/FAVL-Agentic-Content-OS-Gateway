@@ -68,6 +68,9 @@ jobs:
       - name: Type-check
         run: npm run typecheck
 
+      - name: Tests
+        run: npm test
+
       - name: Production dependency audit
         # Dev-only advisories should not block a release; a vulnerable
         # dependency shipped in the runtime image should.
@@ -141,7 +144,11 @@ jobs:
           cache-from: type=gha,scope=${{ matrix.name }}
           cache-to: type=gha,mode=max,scope=${{ matrix.name }}
 
-      - name: Scan image for known vulnerabilities
+      # Two invocations on purpose. The SARIF upload is for triage and must
+      # not fail the job; the gate below must. With only the reporting run,
+      # trivy-action defaults exit-code to 0 and a CRITICAL CVE merged green
+      # while CONTRIBUTING listed image scanning as enforced.
+      - name: Scan image (report)
         uses: aquasecurity/trivy-action@0.28.0
         with:
           image-ref: favl/${{ matrix.name }}:ci
@@ -149,6 +156,15 @@ jobs:
           output: trivy-${{ matrix.name }}.sarif
           severity: CRITICAL,HIGH
           ignore-unfixed: true
+
+      - name: Scan image (gate)
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: favl/${{ matrix.name }}:ci
+          format: table
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+          exit-code: "1"
 
       - name: Upload scan results
         uses: github/codeql-action/upload-sarif@v3
@@ -163,6 +179,19 @@ jobs:
           image: favl/${{ matrix.name }}:ci
           format: spdx-json
           artifact-name: sbom-${{ matrix.name }}.spdx.json
+
+  hooks:
+    name: Pre-commit hooks
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      # .pre-commit-config.yaml claims every hook also runs in CI. Nine of
+      # them had no CI counterpart, so a large binary, a merge-conflict
+      # marker or a private key could merge green.
+      - run: pipx run pre-commit run --all-files --show-diff-on-failure
 
   secrets:
     name: Secret scan

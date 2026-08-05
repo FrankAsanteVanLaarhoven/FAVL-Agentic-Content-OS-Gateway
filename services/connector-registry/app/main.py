@@ -39,6 +39,7 @@ from .schemas import (
     InvocationCreate,
     ValidationReport,
 )
+from .security.policy import clamp_timeout
 from .security.redaction import redact_config
 
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
@@ -580,11 +581,25 @@ async def invoke_connector_internal(
     payload: dict[str, Any],
     session: AsyncSession = Depends(get_session),
     _: None = Depends(require_internal_caller),
+    x_tenant_id: str = Header(default=""),
 ) -> Response:
-    """Orchestrator-facing path. Same runtime, no echo fallback."""
-    record = await session.get(ConnectorRecord, connector_id)
-    if record is None:
-        raise HTTPException(status_code=404, detail="Connector not found")
+    """Orchestrator-facing path. Same runtime, no echo fallback.
+
+    The mesh token proves the caller is inside the cluster; it is NOT
+    authorisation for a tenant. The calling service forwards the tenant it
+    verified, and the same tenant check as the public path applies. Without
+    this, an agent in tenant A could name tenant B's connector id and the
+    gateway would fetch it using B's credentials.
+    """
+    if not x_tenant_id:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error_code": "TENANT_REQUIRED",
+                "message": "internal callers must forward the verified tenant",
+            },
+        )
+    record = await _tenant_connector(session, connector_id, x_tenant_id)
 
     try:
         inv.check_executable(record)
@@ -607,12 +622,15 @@ async def invoke_connector_internal(
         operation=str((record.config or {}).get("operation", "")),
         idempotency_key=key,
         actor_id=f"agent:{agent_id}",
-        # Agents are not tenant-scoped yet, so the connector's own tenant is
-        # the only defensible attribution here. When agents gain a tenant,
-        # this must become the agent's and be checked against the
-        # connector's.
-        tenant_id=record.tenant_id,
-        timeout_seconds=float((record.config or {}).get("timeout_seconds", 15.0)),
+        # The tenant the calling service verified, which _tenant_connector
+        # has already matched against the connector's own.
+        tenant_id=x_tenant_id,
+        # Clamped to the same ceiling the public schema enforces (le=300).
+        # Reading it unbounded here let a connector set a 24-hour deadline
+        # and walk around the declared limit.
+        timeout_seconds=clamp_timeout(
+            (record.config or {}).get("timeout_seconds"), 15.0
+        ),
         trace_id=None,
     )
     if replay is None:

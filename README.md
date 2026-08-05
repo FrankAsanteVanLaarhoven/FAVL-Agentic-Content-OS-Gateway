@@ -89,10 +89,12 @@ same list as disabled navigation entries.
   its own preconditions.
 - Workflow engine, model router, policy engine, memory services, billing,
   developer portal, SDKs.
-- **Connectors and agents are not tenant-scoped.** Invocations are; the
-  resources themselves are not, so any authenticated caller can list and
-  invoke any connector. Closing this needs a tenant column on both tables and
-  is the next security milestone.
+- **Multi-tenancy is single-claim only.** Connectors, agents and invocations
+  are all tenant-scoped (migrations 0007 and orchestrator 0005), and the
+  internal service path enforces the caller's tenant rather than trusting the
+  mesh token. What is missing is tenant administration: there is no way to
+  create a tenant, no per-tenant quota, and the claim comes from a single
+  Keycloak user attribute.
 - **Production identity.** Keycloak runs in development mode against H2 with
   a repository realm. Secrets resolve from environment variables. Both are
   M1.7.
@@ -221,8 +223,8 @@ Colour carries state and nothing else — there is no brand accent, so anything
 coloured on screen means something. Steady state is still; only state
 transitions animate, and `prefers-reduced-motion` is honoured.
 
-Four sections are backed by real data: Workspace, Agents, Connectors,
-Observability, plus Audit and Settings. The other ten appear in the
+6 sections are backed by real data: Workspace, Agents, Connectors,
+Observability, Audit and Settings. The other 8 appear in the
 navigation, disabled, each naming the milestone that delivers it. Nothing in
 the console is mock data.
 
@@ -250,7 +252,7 @@ tests/
 ## Development
 
 ```bash
-make check          # ruff + format + mypy --strict + 162 tests
+make check          # ruff + format + mypy --strict + the Python suite
 make test-outbox    # delivery guarantee, kills containers under load
 make test-identity  # tenant isolation
 ```
@@ -269,7 +271,10 @@ fails when an alert references a metric no code path emits, and
 cp .env.example .env
 ```
 
-   Then set a real `POSTGRES_PASSWORD`; `change-me` is a placeholder.
+   Then set real values for `POSTGRES_PASSWORD`, `KEYCLOAK_CLIENT_SECRET`
+   and `INTERNAL_SERVICE_TOKEN`. All three ship as placeholders, and the
+   client is confidential, so the token request below fails without the
+   secret.
 
 2. Start the stack:
 
@@ -285,6 +290,7 @@ docker compose --env-file .env -f deploy/docker-compose.yml up -d --build
 ```bash
 curl -s \
   -d "client_id=agentic-content-os" \
+  -d "client_secret=$KEYCLOAK_CLIENT_SECRET" \
   -d "username=demo" \
   -d "password=demo-password" \
   -d "grant_type=password" \

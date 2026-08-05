@@ -252,7 +252,14 @@ class OutboxPublisher:
         metrics.PUBLISH.labels(self.service, row.subject, "failure").inc()
         self.last_error = row.last_error
 
-        if row.attempts >= row.max_attempts:
+        # The RUNTIME limit, not the row's stored column. The duplicate-window
+        # gate is computed from retry_policy.max_attempts; if dead-lettering
+        # used row.max_attempts (a DB default of 8) the gate could pass with
+        # OUTBOX_MAX_ATTEMPTS=1 while rows actually retried eight times,
+        # producing a real horizon far outside the window the gate proved.
+        # The two must be the same number.
+        limit = min(self.retry_policy.max_attempts, row.max_attempts)
+        if row.attempts >= limit:
             row.status = STATUS_DEAD
             result.dead_lettered += 1
             metrics.DEAD_LETTER.labels(self.service, row.subject).inc()

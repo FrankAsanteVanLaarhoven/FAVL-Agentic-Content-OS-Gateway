@@ -120,3 +120,31 @@ def test_a_first_event_that_is_not_version_one_is_quarantined():
 
 def test_unorderable_legacy_event_is_quarantined():
     assert version_decision(None, 1) == QUARANTINE
+
+
+def test_malformed_v1_envelope_is_classified_not_crashed():
+    """A missing required field must raise the declared type and be counted.
+
+    It previously raised a bare KeyError, which escaped a consumer's
+    `except UnsupportedSchemaVersion`, killed the handler, and left the
+    rejection counter untouched — an invisible drop.
+    """
+    from favl_outbox.consumer import (
+        SCHEMA_REJECTED,
+        EventParseError,
+        MalformedEnvelope,
+    )
+
+    def rejected() -> float:
+        return SCHEMA_REJECTED.labels("malformed_envelope")._value.get()
+
+    before = rejected()
+    with pytest.raises(MalformedEnvelope):
+        parse_event({"schema_version": 1, "event_type": "agent.created", "data": {}})
+    assert rejected() == before + 1
+
+    # A consumer catching the base type covers every rejection.
+    with pytest.raises(EventParseError):
+        parse_event({"schema_version": 1, "event_id": "x", "data": {}})
+    with pytest.raises(EventParseError):
+        parse_event({"schema_version": 99})

@@ -18,6 +18,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from favl_outbox import enqueue
 
 from .db import SessionLocal, engine, get_session
+from .identity import CallerIdentity, current_identity, current_tenant
 from .models import AgentRecord
 from .outbox import (
     WINDOW_UTILISATION,
@@ -35,7 +36,7 @@ __all__ = ["Agent", "AgentCreate", "Invocation", "app"]
 
 # Readiness fails if the schema is behind: a replica running old code
 # against a migrated database must not receive traffic.
-EXPECTED_MIGRATION = os.getenv("EXPECTED_MIGRATION", "0004")
+EXPECTED_MIGRATION = os.getenv("EXPECTED_MIGRATION", "0005")
 
 # Bounds on a single agent invocation. Without them one agent with a large
 # connector list can hold resources for an unbounded time.
@@ -48,12 +49,18 @@ CONNECTOR_TIMEOUT_SECONDS = float(os.getenv("AGENT_CONNECTOR_TIMEOUT", "15"))
 INTERNAL_SERVICE_TOKEN = os.getenv("INTERNAL_SERVICE_TOKEN", "")
 
 
-def internal_call_headers() -> dict[str, str]:
-    return (
-        {"X-Internal-Service-Token": INTERNAL_SERVICE_TOKEN}
-        if INTERNAL_SERVICE_TOKEN
-        else {}
-    )
+def internal_call_headers(tenant_id: str) -> dict[str, str]:
+    """Headers for a mesh call.
+
+    The service token proves the CALLER is inside the mesh. It says nothing
+    about which tenant the request is for, so the verified tenant travels
+    alongside it and the registry enforces it. Treating the mesh token as
+    authorisation was how tenant A reached tenant B's connector.
+    """
+    headers = {"X-Tenant-ID": tenant_id}
+    if INTERNAL_SERVICE_TOKEN:
+        headers["X-Internal-Service-Token"] = INTERNAL_SERVICE_TOKEN
+    return headers
 
 
 @asynccontextmanager
@@ -191,26 +198,49 @@ async def prometheus_metrics() -> Response:
 
 
 @app.get("/v1/agents", response_model=list[Agent])
-async def list_agents(session: AsyncSession = Depends(get_session)) -> list[Agent]:
-    result = await session.execute(select(AgentRecord).order_by(AgentRecord.created_at))
+async def list_agents(
+    session: AsyncSession = Depends(get_session),
+    tenant_id: str = Depends(current_tenant),
+) -> list[Agent]:
+    result = await session.execute(
+        select(AgentRecord)
+        .where(AgentRecord.tenant_id == tenant_id)
+        .order_by(AgentRecord.created_at)
+    )
     return [_to_schema(record) for record in result.scalars()]
+
+
+async def _tenant_agent(
+    session: AsyncSession, agent_id: uuid.UUID, tenant_id: str
+) -> AgentRecord:
+    """Fetch an agent within the caller's tenant, or 404.
+
+    404 rather than 403: confirming an id exists in another tenant is itself
+    a disclosure.
+    """
+    record = await session.get(AgentRecord, agent_id)
+    if record is None or record.tenant_id != tenant_id:
+        raise HTTPException(status_code=404, detail="Agent not found")
+    return record
 
 
 @app.get("/v1/agents/{agent_id}", response_model=Agent)
 async def get_agent(
-    agent_id: uuid.UUID, session: AsyncSession = Depends(get_session)
+    agent_id: uuid.UUID,
+    session: AsyncSession = Depends(get_session),
+    tenant_id: str = Depends(current_tenant),
 ) -> Agent:
-    record = await session.get(AgentRecord, agent_id)
-    if record is None:
-        raise HTTPException(status_code=404, detail="Agent not found")
-    return _to_schema(record)
+    return _to_schema(await _tenant_agent(session, agent_id, tenant_id))
 
 
 @app.post("/v1/agents", response_model=Agent, status_code=status.HTTP_201_CREATED)
 async def create_agent(
-    payload: AgentCreate, session: AsyncSession = Depends(get_session)
+    payload: AgentCreate,
+    session: AsyncSession = Depends(get_session),
+    tenant_id: str = Depends(current_tenant),
 ) -> Agent:
     record = AgentRecord(
+        tenant_id=tenant_id,
         name=payload.name,
         description=payload.description,
         connector_ids=payload.connector_ids,
@@ -250,11 +280,11 @@ async def create_agent(
     response_model=None,
 )
 async def delete_agent(
-    agent_id: uuid.UUID, session: AsyncSession = Depends(get_session)
+    agent_id: uuid.UUID,
+    session: AsyncSession = Depends(get_session),
+    tenant_id: str = Depends(current_tenant),
 ) -> None:
-    record = await session.get(AgentRecord, agent_id)
-    if record is None:
-        raise HTTPException(status_code=404, detail="Agent not found")
+    record = await _tenant_agent(session, agent_id, tenant_id)
     await session.delete(record)
     enqueue(
         session,
@@ -274,10 +304,9 @@ async def invoke_agent(
     agent_id: uuid.UUID,
     payload: dict[str, Any],
     session: AsyncSession = Depends(get_session),
+    caller: CallerIdentity = Depends(current_identity),
 ) -> dict[str, Any]:
-    record = await session.get(AgentRecord, agent_id)
-    if record is None:
-        raise HTTPException(status_code=404, detail="Agent not found")
+    record = await _tenant_agent(session, agent_id, caller.tenant_id)
 
     connector_ids = list(record.connector_ids)
     if len(connector_ids) > MAX_FAN_OUT:
@@ -305,7 +334,7 @@ async def invoke_agent(
                 response = await client.post(
                     f"{registry_url}/internal/connectors/{connector_id}/invoke",
                     json={"agent_id": str(agent_id), "input": payload},
-                    headers=internal_call_headers(),
+                    headers=internal_call_headers(caller.tenant_id),
                 )
             except httpx.HTTPError as exc:
                 outputs.append(
@@ -350,9 +379,8 @@ async def invoke_agent(
     # event carried version 1, which this repo's own consumer ordering rule
     # (favl_outbox.consumer.version_decision) discards as a replay after the
     # first one.
-    fresh = await session.get(AgentRecord, agent_id, with_for_update=True)
-    if fresh is None:
-        raise HTTPException(status_code=404, detail="Agent not found")
+    fresh = await _tenant_agent(session, agent_id, caller.tenant_id)
+    await session.refresh(fresh, with_for_update=True)
     fresh.version += 1
     enqueue(
         session,

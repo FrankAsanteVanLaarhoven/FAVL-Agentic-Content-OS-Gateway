@@ -17,7 +17,11 @@ from typing import Any
 import httpx
 
 from ..security import outbound
-from ..security.policy import build_policy, rejected_operator_keys
+from ..security.policy import (
+    build_policy,
+    clamp_timeout,
+    rejected_operator_keys,
+)
 from ..security.secrets import (
     SecretNotFound,
     SecretResolver,
@@ -198,10 +202,12 @@ class HttpAdapter:
                     json_body=request.payload,
                     headers=headers,
                     connect_timeout=min(
-                        float(context.config.get("connect_timeout", 5.0)), remaining
+                        clamp_timeout(context.config.get("connect_timeout"), 5.0),
+                        remaining,
                     ),
                     read_timeout=min(
-                        float(context.config.get("read_timeout", 10.0)), remaining
+                        clamp_timeout(context.config.get("read_timeout"), 10.0),
+                        remaining,
                     ),
                     # The deadline always wins over per-phase timeouts.
                     total_timeout=remaining,
