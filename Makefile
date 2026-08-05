@@ -64,4 +64,9 @@ check: lint typecheck test
 test-identity:
 	bash tests/verify_identity.sh
 
-.PHONY: test-identity
+# Drives an alert through fire-and-clear against the live stack. Slow by
+# nature: the rules carry for-clauses measured in minutes.
+test-alerts:
+	bash tests/verify_alerts.sh
+
+.PHONY: test-identity test-alerts

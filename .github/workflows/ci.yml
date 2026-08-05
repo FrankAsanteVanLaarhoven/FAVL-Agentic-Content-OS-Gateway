@@ -231,6 +231,9 @@ jobs:
       - name: Verify the transactional outbox
         run: bash tests/verify_outbox.sh
 
+      - name: Verify alerts fire and clear
+        run: bash tests/verify_alerts.sh
+
       - name: Service logs on failure
         if: failure()
         run: docker compose --env-file .env -f deploy/docker-compose.yml logs --tail=200

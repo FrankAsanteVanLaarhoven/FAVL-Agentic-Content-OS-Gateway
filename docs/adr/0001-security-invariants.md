@@ -102,8 +102,10 @@ name resolving to one public and one private address is rejected outright
 rather than quietly using the public one.
 
 Enforced by `security/ssrf.py::validate_url`, `security/outbound.py`.
-Tested by `test_connection_is_pinned_to_the_validated_address`,
-`test_pinned_address_is_the_normalised_form`. **Not yet failure-validated.**
+Tested by `test_connection_is_pinned_to_the_validated_address` and
+`test_ipv6_pinning_is_bracketed`. **Failure observed** — removing the pin
+fails both. (`test_pinned_address_is_the_normalised_form` guards I2's
+normalisation, not the pin, and is unaffected.)
 
 ## I4 — Identity comes from the verified token; the client cannot name itself
 
@@ -227,6 +229,24 @@ Enforced by review. See CONTRIBUTING.
 
 ---
 
+## I10 — A metric that detects a failure must not be maintained by the thing that fails
+
+Outbox backlog gauges were refreshed only inside the publisher's own loop.
+When the publisher stopped — the precise incident `OutboxOldestPendingTooOld`
+exists to catch — the gauges froze at their last healthy values and the alert
+could not fire. It reported green throughout a real stall.
+
+Gauges are now refreshed on scrape, in the `/metrics` handler, so a scrape
+reflects the database regardless of publisher health.
+
+> Found by writing the alert firing test, not by review. Every earlier check
+> on this alert — promtool, the metric-name checker, the expression rewrite
+> from `and` to `unless` — passed while it remained incapable of firing.
+
+Enforced by `main.py::prometheus_metrics` in both services.
+Tested by `tests/verify_alerts.sh`. **Failure observed** — the test failed
+before this change and passes after.
+
 ## Consequences
 
 Changes touching `security/`, `identity.py`, the `proxy-rewrite` blocks in
@@ -245,5 +265,4 @@ needs a superseding ADR, not a code comment.
 | Secrets resolve from environment variables | Names are derived, never caller-supplied; scoped by owner | M1.7 |
 | No tenant administration; tenant comes from one user attribute | Claim is IdP-issued and unforgeable through the gateway | M3 |
 | Agents may reference a connector id from another tenant at creation | Invocation is refused at fan-out; only the reference is permitted | M1.4 |
-| I3 lacks a demonstrated failure | Covered by positive tests only | M1.4 |
-| Alerts have no firing test | Expressions validated by promtool and a metric-name checker; a stalled-publisher firing test is the next step | M1.4 |
+| `OutboxStalledWhileWriting` has never been observed to fire | The backlog-age alert covers the same incident and IS validated end to end; the metric-name checker proves the expression names real series | M1.4 |

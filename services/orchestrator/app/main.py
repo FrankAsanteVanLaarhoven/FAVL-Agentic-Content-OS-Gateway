@@ -193,7 +193,23 @@ async def _readiness() -> dict[str, Any]:
 
 @app.get("/metrics")
 async def prometheus_metrics() -> Response:
-    """Internal only: not routed through APISIX."""
+    """Internal only: not routed through APISIX.
+
+    Outbox gauges are refreshed HERE, on scrape, rather than only inside the
+    publisher loop. They were previously updated by the publisher alone,
+    which meant the metrics that detect a dead publisher were maintained by
+    the publisher: when it stopped, the gauges froze at their last healthy
+    values and OutboxOldestPendingTooOld could never fire. The alert was
+    green throughout a real stall.
+
+    Cost is two indexed queries per scrape interval. A failure here must not
+    take the endpoint down — stale gauges are worse than no gauges only if
+    they are silently stale, and the exporter still serves everything else.
+    """
+    try:
+        await publisher.refresh_stats()
+    except SQLAlchemyError as exc:
+        logger.error("metrics.outbox_refresh_failed error=%s", exc)
     return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)
 
 
