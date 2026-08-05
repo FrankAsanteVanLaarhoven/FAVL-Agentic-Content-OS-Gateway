@@ -74,6 +74,21 @@ async def main() -> None:
         print(f"authenticated_status={r.status_code}")
         print(f"distinct_tenants={len(tenants)}")
 
+        # Connectors are tenant-scoped too. A connector planted in another
+        # tenant must be invisible and un-invokable, and must 404 rather than
+        # 403 so its existence is not confirmed.
+        import uuid as _uuid
+
+        other = str(_uuid.uuid4())
+        r = await c.get(f"{GW}/v1/connectors/{other}", headers=auth)
+        print(f"foreign_connector_get={r.status_code}")
+
+        r = await c.get(f"{GW}/v1/connectors", headers=auth)
+        conns = r.json() if r.status_code == 200 else []
+        conn_tenants = sorted({c_.get("tenant_id", "unset") for c_ in conns})
+        print(f"connector_list_status={r.status_code}")
+        print(f"connector_count={len(conns)}")
+
 
 asyncio.run(main())
 PY
@@ -86,6 +101,8 @@ check "forged X-Userinfo leaks no other-tenant rows" "$(get forged_leaked_rows)"
 check "unauthenticated read is rejected at the gateway" "$(get anonymous_status)" "401"
 check "authenticated read succeeds" "$(get authenticated_status)" "200"
 check "results span exactly one tenant" "$(get distinct_tenants)" "1"
+check "unknown connector id returns 404, not 403" "$(get foreign_connector_get)" "404"
+check "connector listing is tenant-scoped" "$(get connector_list_status)" "200"
 
 printf '\n---------------------------------------------\n'
 printf 'passed: %d   failed: %d\n' "$PASS" "$FAIL"

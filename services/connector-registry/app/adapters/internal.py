@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 from datetime import UTC, datetime
 from typing import Any
 
@@ -29,6 +30,9 @@ from .base import (
 )
 
 logger = logging.getLogger(__name__)
+
+# Deliberately narrow: no "..", no scheme, no host, no query.
+SAFE_OPERATION = re.compile(r"[A-Za-z0-9._~/-]+")
 
 
 def _load_registry() -> dict[str, str]:
@@ -67,6 +71,25 @@ class InternalAdapter:
             max_response_bytes=int(os.getenv("INTERNAL_MAX_RESPONSE_BYTES", "1048576")),
         )
 
+    @staticmethod
+    def _operation_error(operation: str) -> str | None:
+        """Reject anything that could escape the registered service prefix.
+
+        `operation` is caller-supplied and is joined onto the registry's base
+        URL. Without this, `../../admin/shutdown` walks out of whatever path
+        an operator scoped the entry to, and the caller controls the body.
+        """
+        if not operation:
+            return "config.operation is required"
+        if not SAFE_OPERATION.fullmatch(operation):
+            return (
+                f"config.operation {operation!r} may contain only letters, "
+                "digits, '-', '_', '/' and '.', with no '..' segment"
+            )
+        if ".." in operation.split("/"):
+            return "config.operation may not contain a '..' segment"
+        return None
+
     async def validate_config(self, config: dict[str, Any]) -> ValidationResult:
         errors = []
         service = config.get("service")
@@ -77,8 +100,9 @@ class InternalAdapter:
                 f"service '{service}' is not registered; "
                 f"known services: {sorted(self._registry) or 'none'}"
             )
-        if not config.get("operation"):
-            errors.append("config.operation is required")
+        operation_error = self._operation_error(str(config.get("operation") or ""))
+        if operation_error:
+            errors.append(operation_error)
         if "url" in config:
             errors.append("config.url is not permitted; address services by name")
         if errors:
@@ -144,6 +168,17 @@ class InternalAdapter:
             return InvocationResult.failure(
                 ErrorCode.DEADLINE_EXCEEDED,
                 "deadline passed before dispatch",
+                started_at=started,
+                completed_at=datetime.now(UTC),
+            )
+
+        # Revalidated at invoke time as well as at config time: the record
+        # could have been written before this check existed.
+        operation_error = self._operation_error(operation)
+        if operation_error:
+            return InvocationResult.failure(
+                ErrorCode.OPERATION_NOT_SUPPORTED,
+                operation_error,
                 started_at=started,
                 completed_at=datetime.now(UTC),
             )

@@ -25,7 +25,12 @@ import httpx
 
 from ..security import outbound
 from ..security.policy import build_policy, rejected_operator_keys
-from ..security.secrets import SecretNotFound, SecretResolver, is_secret_reference
+from ..security.secrets import (
+    SecretNotFound,
+    SecretResolver,
+    is_addressable,
+    is_secret_reference,
+)
 from ..security.ssrf import OutboundPolicy, SSRFBlocked
 from .base import (
     ConnectorContext,
@@ -90,6 +95,12 @@ class WebhookAdapter:
             errors.append(
                 "config.signing_secret_ref must be a reference such as "
                 "env:NAME, never a literal secret"
+            )
+        elif not is_addressable(secret_ref):
+            errors.append(
+                f"config.signing_secret_ref references {secret_ref}, which a "
+                "connector may not address; secret names must begin with the "
+                "connector secret prefix"
             )
 
         if config.get("signing_secret"):

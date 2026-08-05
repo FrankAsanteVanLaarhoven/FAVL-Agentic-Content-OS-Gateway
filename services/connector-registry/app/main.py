@@ -47,7 +47,7 @@ logger = logging.getLogger(__name__)
 __all__ = ["Connector", "ConnectorCreate", "app"]
 
 ADAPTERS = build_registry()
-EXPECTED_MIGRATION = os.getenv("EXPECTED_MIGRATION", "0006")
+EXPECTED_MIGRATION = os.getenv("EXPECTED_MIGRATION", "0007")
 
 # /internal/* bypasses APISIX, so it carries no OIDC token. It is protected
 # by a shared service credential compared in constant time, in addition to
@@ -123,6 +123,20 @@ def _to_schema(record: ConnectorRecord) -> Connector:
             "idempotency_mode": record.idempotency_mode,
         }
     )
+
+
+async def _tenant_connector(
+    session: AsyncSession, connector_id: uuid.UUID, tenant_id: str
+) -> ConnectorRecord:
+    """Fetch a connector within the caller's tenant, or 404.
+
+    404 rather than 403 on a tenant mismatch: a 403 would confirm that the id
+    exists somewhere, which is itself a disclosure.
+    """
+    record = await session.get(ConnectorRecord, connector_id)
+    if record is None or record.tenant_id != tenant_id:
+        raise HTTPException(status_code=404, detail="Connector not found")
+    return record
 
 
 def _http_status_for(record: InvocationRecord) -> int:
@@ -279,8 +293,13 @@ async def prometheus_metrics() -> Response:
 async def list_connectors(
     include_deleted: bool = False,
     session: AsyncSession = Depends(get_session),
+    tenant_id: str = Depends(current_tenant),
 ) -> list[Connector]:
-    query = select(ConnectorRecord).order_by(ConnectorRecord.created_at)
+    query = (
+        select(ConnectorRecord)
+        .where(ConnectorRecord.tenant_id == tenant_id)
+        .order_by(ConnectorRecord.created_at)
+    )
     if not include_deleted:
         query = query.where(ConnectorRecord.status != ConnectorStatus.DELETED.value)
     result = await session.execute(query)
@@ -289,11 +308,11 @@ async def list_connectors(
 
 @app.get("/v1/connectors/{connector_id}", response_model=Connector)
 async def get_connector(
-    connector_id: uuid.UUID, session: AsyncSession = Depends(get_session)
+    connector_id: uuid.UUID,
+    session: AsyncSession = Depends(get_session),
+    tenant_id: str = Depends(current_tenant),
 ) -> Connector:
-    record = await session.get(ConnectorRecord, connector_id)
-    if record is None:
-        raise HTTPException(status_code=404, detail="Connector not found")
+    record = await _tenant_connector(session, connector_id, tenant_id)
     return _to_schema(record)
 
 
@@ -301,7 +320,9 @@ async def get_connector(
     "/v1/connectors", response_model=Connector, status_code=status.HTTP_201_CREATED
 )
 async def create_connector(
-    payload: ConnectorCreate, session: AsyncSession = Depends(get_session)
+    payload: ConnectorCreate,
+    session: AsyncSession = Depends(get_session),
+    tenant_id: str = Depends(current_tenant),
 ) -> Connector:
     if not ADAPTERS.has(payload.kind):
         # Fail at registration, not at first invocation.
@@ -326,6 +347,7 @@ async def create_connector(
         )
 
     record = ConnectorRecord(
+        tenant_id=tenant_id,
         name=payload.name,
         kind=payload.kind,
         base_url=str(payload.base_url) if payload.base_url else None,
@@ -360,11 +382,11 @@ async def create_connector(
 
 @app.post("/v1/connectors/{connector_id}/validate", response_model=ValidationReport)
 async def validate_connector(
-    connector_id: uuid.UUID, session: AsyncSession = Depends(get_session)
+    connector_id: uuid.UUID,
+    session: AsyncSession = Depends(get_session),
+    tenant_id: str = Depends(current_tenant),
 ) -> ValidationReport:
-    record = await session.get(ConnectorRecord, connector_id)
-    if record is None:
-        raise HTTPException(status_code=404, detail="Connector not found")
+    record = await _tenant_connector(session, connector_id, tenant_id)
     report = await ADAPTERS.get(record.kind).validate_config(dict(record.config or {}))
     return ValidationReport(
         valid=report.valid,
@@ -376,11 +398,11 @@ async def validate_connector(
 
 @app.post("/v1/connectors/{connector_id}/health", response_model=HealthReport)
 async def connector_health(
-    connector_id: uuid.UUID, session: AsyncSession = Depends(get_session)
+    connector_id: uuid.UUID,
+    session: AsyncSession = Depends(get_session),
+    tenant_id: str = Depends(current_tenant),
 ) -> HealthReport:
-    record = await session.get(ConnectorRecord, connector_id)
-    if record is None:
-        raise HTTPException(status_code=404, detail="Connector not found")
+    record = await _tenant_connector(session, connector_id, tenant_id)
     context = ConnectorContext(
         connector_id=str(record.id),
         connector_version=record.version,
@@ -415,9 +437,9 @@ async def request_connector_deletion(
     deletion becomes a later privileged operation with its own preconditions.
     The caller still sees 204, since the transition completes synchronously.
     """
-    record = await session.get(ConnectorRecord, connector_id, with_for_update=True)
-    if record is None:
-        raise HTTPException(status_code=404, detail="Connector not found")
+    record = await _tenant_connector(session, connector_id, caller.tenant_id)
+    # Re-read under a row lock now that the tenant is confirmed.
+    await session.refresh(record, with_for_update=True)
 
     if record.status == ConnectorStatus.DELETED.value:
         raise HTTPException(
@@ -465,9 +487,7 @@ async def invoke_connector_v1(
     session: AsyncSession = Depends(get_session),
     caller: CallerIdentity = Depends(current_identity),
 ) -> Response:
-    record = await session.get(ConnectorRecord, connector_id)
-    if record is None:
-        raise HTTPException(status_code=404, detail="Connector not found")
+    record = await _tenant_connector(session, connector_id, caller.tenant_id)
 
     try:
         inv.check_executable(record)
@@ -560,7 +580,7 @@ async def invoke_connector_internal(
     payload: dict[str, Any],
     session: AsyncSession = Depends(get_session),
     _: None = Depends(require_internal_caller),
-) -> dict[str, Any]:
+) -> Response:
     """Orchestrator-facing path. Same runtime, no echo fallback."""
     record = await session.get(ConnectorRecord, connector_id)
     if record is None:
@@ -587,22 +607,32 @@ async def invoke_connector_internal(
         operation=str((record.config or {}).get("operation", "")),
         idempotency_key=key,
         actor_id=f"agent:{agent_id}",
-        tenant_id="default",
+        # Agents are not tenant-scoped yet, so the connector's own tenant is
+        # the only defensible attribution here. When agents gain a tenant,
+        # this must become the agent's and be checked against the
+        # connector's.
+        tenant_id=record.tenant_id,
         timeout_seconds=float((record.config or {}).get("timeout_seconds", 15.0)),
         trace_id=None,
     )
     if replay is None:
         invocation = await inv.execute(session, ADAPTERS, record, invocation, body)
 
-    return {
-        "invocation_id": str(invocation.id),
-        "connector_id": str(connector_id),
-        "connector_kind": record.kind,
-        "status": invocation.status,
-        "error_code": invocation.error_code,
-        "retryable": invocation.retryable,
-        "output": invocation.output,
-    }
+    # Status must be carried in the HTTP code, not only the body: the
+    # orchestrator branches on `response.status_code >= 400`, so returning a
+    # plain dict made every failed connector call read as "completed".
+    return JSONResponse(
+        {
+            "invocation_id": str(invocation.id),
+            "connector_id": str(connector_id),
+            "connector_kind": record.kind,
+            "status": invocation.status,
+            "error_code": invocation.error_code,
+            "retryable": invocation.retryable,
+            "output": invocation.output,
+        },
+        status_code=_http_status_for(invocation),
+    )
 
 
 @app.exception_handler(UnknownAdapterKind)

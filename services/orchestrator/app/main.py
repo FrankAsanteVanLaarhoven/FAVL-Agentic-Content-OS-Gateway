@@ -318,11 +318,20 @@ async def invoke_agent(
                 continue
 
             if response.status_code >= 400:
+                # The registry reports terminal state in the status code and
+                # a classified error_code in the body; prefer the latter over
+                # echoing a raw response.
+                try:
+                    body = response.json()
+                except ValueError:
+                    body = {}
                 outputs.append(
                     {
                         "connector_id": connector_id,
-                        "status": "failed",
-                        "detail": response.text,
+                        "status": body.get("status", "failed"),
+                        "error_code": body.get("error_code"),
+                        "retryable": body.get("retryable"),
+                        "http_status": response.status_code,
                     }
                 )
             else:

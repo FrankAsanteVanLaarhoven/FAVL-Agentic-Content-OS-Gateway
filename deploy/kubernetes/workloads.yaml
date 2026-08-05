@@ -162,6 +162,47 @@ spec:
   ports:
     - { name: http, port: 8000, targetPort: http }
 ---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: connector-registry-migrate
+  namespace: agentic-content-os
+  annotations:
+    # Must complete before the Deployment is applied.
+    argocd.argoproj.io/hook: PreSync
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+spec:
+  backoffLimit: 3
+  ttlSecondsAfterFinished: 3600
+  template:
+    metadata:
+      name: connector-registry-migrate
+    spec:
+      restartPolicy: Never
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: migrate
+          image: ghcr.io/frankasantevanlaarhoven/favl-connector-registry@sha256:0000000000000000000000000000000000000000000000000000000000000000
+          command: ["alembic", "upgrade", "head"]
+          envFrom:
+            - secretRef:
+                name: connector-registry-database
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              cpu: 50m
+              memory: 128Mi
+            limits:
+              memory: 256Mi
+---
 apiVersion: apps/v1
 kind: Deployment
 metadata:

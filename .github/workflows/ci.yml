@@ -180,9 +180,10 @@ jobs:
   integration:
     name: Integration — delivery guarantee and tenant isolation
     runs-on: ubuntu-24.04
-    # The suite kills containers under load and asserts on recovery; it is
-    # slow by design, so it does not gate every push.
-    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    # Runs on pull requests too. Gating only pushes to main meant a change
+    # that broke delivery or tenant isolation merged green and failed
+    # afterwards, when the signal no longer blocks anything.
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
 

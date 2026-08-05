@@ -4,6 +4,14 @@
 .env
 .env.*
 !.env.example
+# Node — the console build context is the REPOSITORY ROOT for both compose
+# and CI, so apps/console/.dockerignore was never read. Without these, a
+# locally-developed tree copies host node_modules over the npm ci layer,
+# producing an image whose dependencies were never resolved by the lockfile.
+**/node_modules
+**/.next
+**/*.tsbuildinfo
+
 **/__pycache__
 **/*.py[cod]
 **/.pytest_cache

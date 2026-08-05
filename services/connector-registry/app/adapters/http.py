@@ -18,7 +18,12 @@ import httpx
 
 from ..security import outbound
 from ..security.policy import build_policy, rejected_operator_keys
-from ..security.secrets import SecretNotFound, SecretResolver, is_secret_reference
+from ..security.secrets import (
+    SecretNotFound,
+    SecretResolver,
+    is_addressable,
+    is_secret_reference,
+)
 from ..security.ssrf import OutboundPolicy, SSRFBlocked
 from .base import (
     ConnectorContext,
@@ -71,6 +76,13 @@ class HttpAdapter:
 
         for key, value in (config.get("headers") or {}).items():
             if is_secret_reference(value):
+                if not is_addressable(value):
+                    errors.append(
+                        f"header '{key}' references {value}, which a connector "
+                        f"may not address. Secret names must begin with the "
+                        f"connector secret prefix; the process environment "
+                        f"also holds database and service credentials."
+                    )
                 continue
             if key.lower() in ("authorization", "x-api-key"):
                 errors.append(

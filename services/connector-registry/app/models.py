@@ -61,12 +61,20 @@ class ConnectorRecord(Base):
             "kind IN ('http', 'mcp', 'webhook', 'internal')",
             name="ck_connectors_kind",
         ),
+        # Per tenant, not global: two tenants must both be able to register
+        # "github", and a global constraint would leak the existence of
+        # another tenant's connector through a 409.
+        UniqueConstraint("tenant_id", "name", name="uq_connectors_tenant_name"),
+        Index("ix_connectors_tenant", "tenant_id", "created_at"),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
     )
-    name: Mapped[str] = mapped_column(String(80), nullable=False, unique=True)
+    tenant_id: Mapped[str] = mapped_column(
+        String(255), nullable=False, default="default", server_default="default"
+    )
+    name: Mapped[str] = mapped_column(String(80), nullable=False)
     kind: Mapped[str] = mapped_column(String(16), nullable=False)
     base_url: Mapped[str | None] = mapped_column(String(2048), nullable=True)
     scopes: Mapped[list[str]] = mapped_column(

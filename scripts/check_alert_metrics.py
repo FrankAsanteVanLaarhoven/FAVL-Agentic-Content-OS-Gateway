@@ -36,7 +36,9 @@ DERIVED_SUFFIXES = ("_total", "_bucket", "_sum", "_count", "_created", "_info")
 DECLARATION = re.compile(
     r'(?:Counter|Gauge|Histogram|Summary)\(\s*["\']([a-zA-Z_:][a-zA-Z0-9_:]*)["\']'
 )
-IDENTIFIER = re.compile(r"\b([a-z_][a-z0-9_]*(?::[a-z0-9_]+)*)\b")
+# Metric names may contain uppercase; restricting to lowercase silently
+# skipped any such reference, so a typo in one never failed the build.
+IDENTIFIER = re.compile(r"\b([A-Za-z_][A-Za-z0-9_]*(?::[A-Za-z0-9_]+)*)\b")
 
 # Quoted strings hold label values and regex alternations, never metric names.
 QUOTED = re.compile(r"""(["']).*?\1""", re.DOTALL)
@@ -148,9 +150,15 @@ def declared_metrics() -> set[str]:
 
 
 def _strip_non_metric_syntax(expression: str) -> str:
-    """Remove everything in an expression that cannot be a metric name."""
-    expression = QUOTED.sub(" ", expression)
+    """Remove everything in an expression that cannot be a metric name.
+
+    Order matters: label matchers are removed BEFORE quoted strings. Stripping
+    quotes first would blank an entire quoted-scalar expression
+    (`expr: "favl_outbox_pending > 100"`), leaving nothing to check — the
+    checker reported success on a rule it had never read.
+    """
     expression = LABEL_MATCHER.sub(" ", expression)
+    expression = QUOTED.sub(" ", expression)
     return GROUPING.sub(" ", expression)
 
 
@@ -168,6 +176,9 @@ def referenced_metrics() -> dict[str, int]:
             in_expr = True
             expr_indent = indent
             body = stripped[len("expr:") :].lstrip("|>-").strip()
+            # A quoted scalar is the whole expression, not a label value.
+            if len(body) >= 2 and body[0] == body[-1] and body[0] in "\"'":
+                body = body[1:-1]
         elif in_expr and stripped and indent <= expr_indent:
             # Dedent back to sibling key level ends the block scalar.
             in_expr = False

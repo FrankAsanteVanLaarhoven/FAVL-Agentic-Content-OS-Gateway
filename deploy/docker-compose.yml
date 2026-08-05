@@ -58,6 +58,15 @@ services:
       WEBHOOK_SIGNING_KEY: ${WEBHOOK_SIGNING_KEY:-dev-signing-key}
       INTERNAL_SERVICE_TOKEN: ${INTERNAL_SERVICE_TOKEN}
       ALLOW_ANONYMOUS_IDENTITY: ${ALLOW_ANONYMOUS_IDENTITY:-false}
+      # Outbound reach is deployment policy. These defaults are the
+      # DEVELOPMENT posture: the local test provider is plaintext on a
+      # private compose network. A production deployment leaves them unset,
+      # which yields https-only and no private addressing.
+      OUTBOUND_ALLOWED_SCHEMES: ${OUTBOUND_ALLOWED_SCHEMES:-https}
+      OUTBOUND_ALLOW_PRIVATE_ADDRESSES: ${OUTBOUND_ALLOW_PRIVATE_ADDRESSES:-false}
+      OUTBOUND_MAX_RESPONSE_BYTES: ${OUTBOUND_MAX_RESPONSE_BYTES:-1048576}
+      CONNECTOR_SECRET_PREFIX: ${CONNECTOR_SECRET_PREFIX:-CONNECTOR_SECRET_}
+      CONNECTOR_SECRET_WEBHOOK_SIGNING_KEY: ${WEBHOOK_SIGNING_KEY:-dev-signing-key}
     depends_on:
       nats:
         condition: service_started

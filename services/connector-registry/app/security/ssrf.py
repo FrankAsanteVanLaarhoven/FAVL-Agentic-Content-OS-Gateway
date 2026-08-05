@@ -59,6 +59,17 @@ ALWAYS_FORBIDDEN: tuple[tuple[IPv4Network | IPv6Network, str], ...] = (
     # Carrier-grade NAT: routable inside many provider networks and a common
     # path to infrastructure the deployment does not own.
     (IPv4Network("100.64.0.0/10"), "shared_address_space"),
+    # Deprecated site-local. A kernel routes it as ordinary global unicast if
+    # an operator has a route, and nothing else in either table covers it.
+    (IPv6Network("fec0::/10"), "site_local_address"),
+    # IPv4-compatible and IPv4-translated embeddings. Generally unroutable on
+    # Linux, but classified rather than left to the host stack.
+    (IPv6Network("::/96"), "ipv4_compatible_address"),
+    (IPv6Network("::ffff:0:0:0/96"), "ipv4_translated_address"),
+    # 6to4 relay anycast.
+    (IPv4Network("192.88.99.0/24"), "reserved_address"),
+    (IPv6Network("2001:db8::/32"), "documentation_address"),
+    (IPv6Network("100::/64"), "discard_only_address"),
 )
 
 # Blocked unless the deployment explicitly permits private addressing.

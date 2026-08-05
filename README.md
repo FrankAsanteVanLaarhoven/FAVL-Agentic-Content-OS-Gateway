@@ -31,7 +31,11 @@ on a shared PostgreSQL instance, so no service can read another's tables.
 - Kubernetes Gateway API examples
 - Docker Compose developer environment
 - Health/readiness endpoints reporting per-dependency state
+- Operator console (`apps/console`), wired to real data only
+- Tenant isolation: identity derived from the gateway-verified token
+- SSRF controls with address normalisation and an operator-owned policy
 - Contract tests, run in a repository-local `.venv`
+- CI: lint, `mypy --strict`, tests, image scanning, SBOM, secret scanning
 - Secure configuration via environment variables
 
 ## Connector runtime
@@ -76,7 +80,8 @@ returned through the API, written to an event, or logged.
 
 ## Not yet implemented
 
-Named here so the gap is explicit rather than assumed:
+Named here so the gap is explicit rather than assumed. The console shows the
+same list as disabled navigation entries.
 
 - MCP and A2A adapters, OAuth-heavy SaaS connectors, plugin execution.
 - Hard deletion. `DELETE` performs a soft transition to
@@ -84,6 +89,16 @@ Named here so the gap is explicit rather than assumed:
   its own preconditions.
 - Workflow engine, model router, policy engine, memory services, billing,
   developer portal, SDKs.
+- **Connectors and agents are not tenant-scoped.** Invocations are; the
+  resources themselves are not, so any authenticated caller can list and
+  invoke any connector. Closing this needs a tenant column on both tables and
+  is the next security milestone.
+- **Production identity.** Keycloak runs in development mode against H2 with
+  a repository realm. Secrets resolve from environment variables. Both are
+  M1.7.
+- **Event streaming to the console is polled, not streamed.** The event
+  console refetches every three seconds and says so; a NATS-to-SSE bridge is
+  the next step.
 
 ## Delivery guarantee
 
@@ -155,24 +170,96 @@ Deduplicate on `event_id` — it is stable across every republication and is
 the same value used as `Nats-Msg-Id`. Use `aggregate_version` to reject stale
 events and detect gaps; do not infer either from stream order.
 
+## Outbound security
+
+The HTTP adapter is an SSRF primitive without controls, so two rules govern
+every outbound request.
+
+**Reach is operator policy, not connector configuration.** `allow_private_
+addresses`, `allowed_schemes` and `allow_plaintext_acknowledged` are read from
+the deployment environment and rejected if they appear in a connector record.
+They were previously caller-supplied, which let anyone who could create a
+connector point a hostname at RFC1918 space and turn the gateway into an
+authenticated proxy into the internal network. A destination must never be
+able to vouch for itself; connector config may narrow the policy, never widen
+it.
+
+**Addresses are normalised before they are classified.**
+`::ffff:169.254.169.254` reaches the cloud metadata service, but on Python
+3.11 — what the containers run — `is_link_local` is False, because the stdlib
+only began unwrapping v4-mapped forms in 3.12.4. The test venv runs 3.13, so
+the suite passed while production was exposed. Every embedded-IPv4 form
+(v4-mapped, 6to4, Teredo, NAT64) is unwrapped first, and forbidden ranges are
+declared as explicit networks rather than inferred from `is_*` properties that
+change between releases.
+
+Beyond that: allowlisted hosts, HTTPS by default, every resolved address
+validated, the connection pinned to a validated address to close the DNS
+rebinding window, redirects revalidated per hop, response size and
+content-type capped, and inbound `Authorization` / `Cookie` / `X-API-Key`
+never forwarded. Connector configuration is redacted on every read path.
+
+## Identity
+
+Tenant and actor come from the token APISIX verified, never from a request
+header. The gateway strips inbound `X-Tenant-ID` and `X-Actor-ID`; the service
+reads claims from `X-Userinfo` and fails closed without them. Invocation reads
+are tenant-scoped and return 404 rather than 403 on a mismatch, since
+confirming that an id exists in another tenant is itself a disclosure.
+`tests/verify_identity.sh` asserts a forged `X-Userinfo` leaks nothing.
+
+## Operator console
+
+`apps/console` — Next.js 15, React 19, Tailwind v4. Run it with the stack and
+open `http://localhost:3100`.
+
+The browser never holds a credential: route handlers attach a server-side
+token and call through APISIX, so the console exercises the same authenticated
+path an external client would.
+
+Colour carries state and nothing else — there is no brand accent, so anything
+coloured on screen means something. Steady state is still; only state
+transitions animate, and `prefers-reduced-motion` is honoured.
+
+Four sections are backed by real data: Workspace, Agents, Connectors,
+Observability, plus Audit and Settings. The other ten appear in the
+navigation, disabled, each naming the milestone that delivers it. Nothing in
+the console is mock data.
+
 ## Repository layout
 
 ```text
 gateway/
-  apisix.yaml
+  apisix.yaml            # routes, OIDC, identity header stripping
   config.yaml
 packages/
   favl-outbox/           # transactional outbox library, shared by services
 services/
   orchestrator/          # agents API, outbox publisher, migrations
-  connector-registry/    # connectors API, outbox publisher, migrations
+  connector-registry/    # connectors API, adapters, invocations, migrations
+apps/
+  console/               # FAVL Command Center
 deploy/
-  docker-compose.yml
-  postgres/
-  prometheus.yml
-  kubernetes/
+  docker-compose.yml     # images pinned by tag@digest
+  kubernetes/            # probes, PDBs, migration Job, non-root workloads
+  prometheus.yml, prometheus-alerts.yml
+scripts/                 # build-gating checkers
 tests/
 ```
+
+## Development
+
+```bash
+make check          # ruff + format + mypy --strict + 162 tests
+make test-outbox    # delivery guarantee, kills containers under load
+make test-identity  # tenant isolation
+```
+
+CI runs the same commands, plus image scanning, SBOM generation and a
+full-history secret scan. Two custom checkers gate the build and were each
+validated against a deliberately introduced fault: `check_alert_metrics.py`
+fails when an alert references a metric no code path emits, and
+`check_image_pins.py` fails on any image reference without a digest.
 
 ## Local start
 

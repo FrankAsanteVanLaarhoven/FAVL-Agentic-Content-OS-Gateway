@@ -325,13 +325,106 @@ def test_secret_references_are_recognised():
     assert not is_secret_reference("literal")
 
 
-def test_env_resolver_reads_only_env_references(monkeypatch):
-    monkeypatch.setenv("MY_KEY", "value")
-    assert run(EnvSecretResolver().resolve("env:MY_KEY")) == "value"
+def test_env_resolver_reads_only_addressable_references(monkeypatch):
+    monkeypatch.setenv("CONNECTOR_SECRET_MY_KEY", "value")
+    assert run(EnvSecretResolver().resolve("env:CONNECTOR_SECRET_MY_KEY")) == "value"
     with pytest.raises(SecretNotFound):
         run(EnvSecretResolver().resolve("vault:nope"))
     with pytest.raises(SecretNotFound):
-        run(EnvSecretResolver().resolve("env:ABSENT"))
+        run(EnvSecretResolver().resolve("env:CONNECTOR_SECRET_ABSENT"))
+
+
+@pytest.mark.parametrize(
+    "reference",
+    [
+        "env:INTERNAL_SERVICE_TOKEN",
+        "env:POSTGRES_PASSWORD",
+        "env:KEYCLOAK_CLIENT_SECRET",
+        "env:PATH",
+    ],
+)
+def test_connector_cannot_address_operator_secrets(reference, monkeypatch):
+    """A connector must not be able to name an arbitrary environment value.
+
+    The process environment holds the database password and the token that
+    authenticates /internal. An unconstrained `env:` reference in a header
+    would send it to a caller-chosen host on the first invocation, which
+    escalates straight back into the internal surface.
+    """
+    from app.security.secrets import SecretNotPermitted, is_addressable
+
+    monkeypatch.setenv(reference.removeprefix("env:"), "operator-secret")
+    assert not is_addressable(reference)
+    with pytest.raises(SecretNotPermitted):
+        run(EnvSecretResolver().resolve(reference))
+
+
+def test_http_adapter_rejects_a_non_addressable_secret_reference():
+    adapter = build_registry().get("http")
+    report = run(
+        adapter.validate_config(
+            {
+                "base_url": "https://api.example.com",
+                "allowed_hosts": ["api.example.com"],
+                "headers": {"X-Telemetry": "env:INTERNAL_SERVICE_TOKEN"},
+            }
+        )
+    )
+    assert not report.valid
+    assert any("may not address" in e for e in report.errors)
+
+
+@pytest.mark.parametrize(
+    "field,requested,ceiling_env,ceiling_value",
+    [
+        ("max_response_bytes", 10_000_000_000, "OUTBOUND_MAX_RESPONSE_BYTES", "65536"),
+        ("max_redirects", 100_000, "OUTBOUND_MAX_REDIRECTS", "3"),
+    ],
+)
+def test_numeric_bounds_are_clamped_to_the_operator_ceiling(
+    field, requested, ceiling_env, ceiling_value, monkeypatch
+):
+    """Caller-supplied bounds may narrow, never widen.
+
+    These three fields stayed caller-controlled after the first fix because
+    the design was a per-key denylist and they were never added to it. The
+    clamp is the boundary; the denylist only produces a better message.
+    """
+    from app.security.policy import build_policy
+
+    monkeypatch.setenv(ceiling_env, ceiling_value)
+    policy = build_policy({"allowed_hosts": ["api.example.com"], field: requested})
+    assert getattr(policy, field) == int(ceiling_value)
+
+
+def test_content_types_are_intersected_not_replaced(monkeypatch):
+    from app.security.policy import build_policy
+
+    monkeypatch.delenv("OUTBOUND_ALLOWED_CONTENT_TYPES", raising=False)
+    policy = build_policy(
+        {"allowed_hosts": ["a"], "allowed_content_types": ["*/*", "application/json"]}
+    )
+    assert "*/*" not in policy.allowed_content_types
+    assert "application/json" in policy.allowed_content_types
+
+
+def test_narrowing_a_bound_is_honoured(monkeypatch):
+    from app.security.policy import build_policy
+
+    monkeypatch.setenv("OUTBOUND_MAX_RESPONSE_BYTES", "1048576")
+    policy = build_policy({"allowed_hosts": ["a"], "max_response_bytes": 1024})
+    assert policy.max_response_bytes == 1024
+
+
+@pytest.mark.parametrize(
+    "operation",
+    ["../../admin/shutdown", "a/../../b", "http://evil.example.net/", "..%2f..%2fx"],
+)
+def test_internal_operation_cannot_escape_the_registered_prefix(operation):
+    """`operation` is joined onto the registry base URL and is caller config."""
+    adapter = InternalAdapter(registry={"svc": "http://svc:8080/api/v1"})
+    report = run(adapter.validate_config({"service": "svc", "operation": operation}))
+    assert not report.valid
 
 
 def test_secret_not_found_names_the_reference_not_the_value():

@@ -64,9 +64,24 @@ check "no pending backlog remains" \
 # --------------------------------------------------------------------------
 banner "3/6  republication produces no duplicate downstream effect"
 # --------------------------------------------------------------------------
+# Deduplication is bounded by the stream's duplicate window (2h), so this
+# check is only meaningful on rows published inside it. An earlier version
+# selected arbitrary rows with `LIMIT 10` and no ORDER BY, which picked
+# whatever Postgres returned first — on a long-lived database those were
+# hours old and legitimately outside the window, so the test failed while the
+# system was behaving exactly as designed. It scopes to the rows step 2 just
+# published, and asserts that precondition rather than assuming it.
 JS_BEFORE=$(js_count)
+OLDEST=$(psql_orch "SELECT COALESCE(MAX(EXTRACT(EPOCH FROM now() - published_at))::int, 0)
+                    FROM outbox_events
+                    WHERE payload->>'name' LIKE '$RUN-%' AND status='published'")
+check "republished rows are inside the duplicate window" \
+  "$([ "${OLDEST:-99999}" -lt 7200 ] && echo yes || echo no)" "yes"
+
 psql_orch "UPDATE outbox_events SET status='pending', next_attempt_at=now(), published_at=NULL
-           WHERE id IN (SELECT id FROM outbox_events WHERE status='published' LIMIT 10)" >/dev/null
+           WHERE id IN (SELECT id FROM outbox_events
+                        WHERE payload->>'name' LIKE '$RUN-%' AND status='published'
+                        ORDER BY created_at DESC LIMIT 10)" >/dev/null
 drain 20
 check "stream count unchanged after 10 republished ids" "$(js_count)" "$JS_BEFORE"
 

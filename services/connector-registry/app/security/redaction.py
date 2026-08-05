@@ -46,27 +46,46 @@ def redact_value(key: str, value: Any) -> Any:
     return value
 
 
+def _redact_headers(headers: dict[str, Any]) -> dict[str, Any]:
+    return {
+        header: (
+            header_value
+            if _is_reference(header_value)
+            else (
+                REDACTED
+                if SENSITIVE_HEADER.match(header) or SENSITIVE_KEY.search(header)
+                else header_value
+            )
+        )
+        for header, header_value in headers.items()
+    }
+
+
+def _redact_any(key: str, value: Any) -> Any:
+    """Redact a value of any shape, carrying the key's sensitivity inward.
+
+    Lists were previously returned untouched, so a credential nested inside
+    one — `{"profiles": [{"password": "..."}]}` — was published verbatim to
+    the API and to NATS. Top-level key validation does not see it either,
+    because it only intersects the outermost key names.
+    """
+    if isinstance(value, dict):
+        if key.lower() == "headers":
+            return _redact_headers(value)
+        return redact_config(value)
+    if isinstance(value, list | tuple):
+        # A sensitive key makes every element sensitive: {"tokens": [...]}.
+        if SENSITIVE_KEY.search(key):
+            return [REDACTED if not _is_reference(item) else item for item in value]
+        return [_redact_any(key, item) for item in value]
+    return redact_value(key, value)
+
+
 def redact_config(config: dict[str, Any]) -> dict[str, Any]:
-    """Deep-redact a connector configuration for publication."""
-    out: dict[str, Any] = {}
-    for key, value in config.items():
-        if isinstance(value, dict):
-            if key.lower() == "headers":
-                out[key] = {
-                    header: (
-                        header_value
-                        if _is_reference(header_value)
-                        else (
-                            REDACTED
-                            if SENSITIVE_HEADER.match(header)
-                            or SENSITIVE_KEY.search(header)
-                            else header_value
-                        )
-                    )
-                    for header, header_value in value.items()
-                }
-            else:
-                out[key] = redact_config(value)
-        else:
-            out[key] = redact_value(key, value)
-    return out
+    """Deep-redact a connector configuration for publication.
+
+    Recurses through dicts AND lists. Anything leaving the service passes
+    through here, so a credential that slipped past edge validation is never
+    republished.
+    """
+    return {key: _redact_any(key, value) for key, value in config.items()}
