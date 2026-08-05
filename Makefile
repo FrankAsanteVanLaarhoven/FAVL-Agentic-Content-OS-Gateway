@@ -59,13 +59,16 @@ typecheck: venv
 	cd services/connector-registry && $(MYPY) app
 
 # Everything CI runs, in the order CI runs it.
-check: lint typecheck test
+check: lint typecheck test obligations
 
 test-identity:
 	bash tests/verify_identity.sh
 
 # Drives an alert through fire-and-clear against the live stack. Slow by
 # nature: the rules carry for-clauses measured in minutes.
+obligations: venv
+	$(VENV)/bin/python scripts/check_dormant_obligations.py
+
 test-lifecycle:
 	./tests/verify_lifecycle.sh
 

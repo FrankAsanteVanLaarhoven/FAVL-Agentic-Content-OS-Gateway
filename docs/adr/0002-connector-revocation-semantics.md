@@ -76,17 +76,29 @@ credentials           → unavailable for subsequent retries
 |---|---|---|
 | `status → revoked` | **implemented** | `lifecycle.TRANSITIONS`, migration 0008 |
 | New invocations rejected | **implemented** | `invocations.check_executable`; `verify_lifecycle.sh` §3, failure-validated |
-| Queued invocations cancelled | **vacuous today** | see below |
+| Queued invocations cancelled | **dormant — not applicable, not satisfied** | see below |
 | Running invocations finish | **implemented** — this is current behaviour, now the intended behaviour | `verify_lifecycle.sh` §3 asserts it |
 | Credentials unavailable for retries | **implemented, by construction** | see below |
 
-**Queued invocations cancelled — vacuous today.** Execution is synchronous:
-`invocations.accept()` commits `ACCEPTED` and `invocations.execute()`
-immediately sets `RUNNING` inside the same request. There is no queue, no
-worker pool, and no external actor positioned to cancel anything in that
-window. The clause is not satisfied; there is nothing for it to be satisfied
-*by*. It becomes load-bearing the moment asynchronous execution lands, which
-is exactly when it will be easiest to forget — recorded as REV-001.
+**Queued invocations cancelled — dormant, not satisfied.**
+
+```
+Current status:    not applicable under synchronous execution.
+Activation:        introduction of asynchronous dispatch or worker queues.
+Required control:  revocation-aware dequeue/cancellation before RUNNING.
+```
+
+Execution is synchronous: `invocations.accept()` commits `ACCEPTED` and
+`invocations.execute()` immediately sets `RUNNING` inside the same request.
+There is no queue, no worker pool, and no external actor positioned to cancel
+anything in that window.
+
+The distinction that matters: the clause is not *implemented*, it is
+*inapplicable*. Nothing violates it because nothing can. It becomes
+load-bearing the moment asynchronous execution lands — which is exactly when
+it will be easiest to forget, because the person building the worker is
+thinking about throughput and the suite is green. Hence REV-001 is bound to
+its activation triggers rather than left as prose.
 
 **Credentials unavailable for retries — by construction.** Nothing in this
 service automatically re-attempts a failed invocation; `attempt` is always 1
@@ -101,6 +113,27 @@ this line becomes false silently. Recorded as REV-002.
 acceptance and already exists — it is what "under their accepted authority
 snapshot" refers to. A running invocation completes against the connector as
 it was configured when it was accepted, not as it is now.
+
+## Dormant obligations are enforced, not merely written
+
+REV-001, REV-002 and REV-003 are **activation-triggered obligations**. Each is
+bound to the capability whose arrival makes it real, and
+`scripts/check_dormant_obligations.py` fails the build when a trigger appears
+without its control:
+
+| Obligation | Fires when the source gains | Required control |
+|---|---|---|
+| REV-001 | a worker or background dispatch, a queue table or claim/dequeue operation, an invocation-queue subject, an async retry scheduler | `revocation_aware_dequeue()` — re-read executability when the invocation LEAVES the queue, before it reaches RUNNING |
+| REV-002 | `attempt` incremented, a retry scheduler, a query reading `FAILED_RETRYABLE` rows back, a delayed task, a provider backoff loop | `reauthorise_attempt()` — re-evaluate connector status, tenant ownership, credential version, revocation timestamp, authority snapshot and deadline |
+| REV-003 | a revocation mode, cancellation propagation, credential invalidation | `revocation_checkpoint()` before secret resolution, each provider call, each retry, each redirect hop, each side-effecting step |
+
+A retry must never inherit credentials or authority merely because the
+original attempt was accepted. That is the whole content of REV-002, and it is
+the assumption a retry loop makes by default.
+
+None of these may be closed on the strength of the control existing. Each
+names the failure-injection test that must be observed failing first — the
+check is a tripwire, not a proof, and it says so.
 
 ## Emergency revocation
 
@@ -137,6 +170,13 @@ before committing a side-effecting step
 
 Where these stand today, honestly:
 
+Emergency-mode checkpoints must be introduced only alongside an actual
+emergency state, an actor able to trigger it, cancellation propagation,
+credential invalidation, and tests proving interruption *between* redirect
+hops or provider calls. Unreachable security code creates false confidence
+precisely because it cannot be failure-validated — it is indistinguishable
+from a control that works.
+
 | Checkpoint | Today |
 |---|---|
 | Before secret resolution | **satisfied** — `check_executable` runs before the adapter, which resolves secrets in `_headers` |
@@ -166,6 +206,12 @@ cancel_queued
 cancel_running_requested
 credentials_invalidated_at
 ```
+
+The connector aggregate should carry only what an operational decision needs
+— `status`, `revoked_at`, `revocation_mode`, `aggregate_version`. The audit
+record stays authoritative for *who* and *why*; a second, mutable
+representation of the same fact on the aggregate is the failure ADR 0001
+exists to prevent.
 
 Three of these already exist in another form. They are listed anyway so the
 implementer reconciles rather than duplicates — a second `revoked_by`

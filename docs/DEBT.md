@@ -109,9 +109,16 @@ under the authority snapshot pinned at acceptance; emergency revocation is a
 separate operation. `verify_lifecycle.sh` §3 now asserts the chosen behaviour
 instead of reporting it, which was this item's completion criterion.
 
-The three implementation items the decision created are below. They are
-tracked as debt rather than left inside the ADR, because a design recorded in
-a document nobody re-reads is indistinguishable from a design nobody built.
+The three implementation items the decision created are below, and they are
+**executable, not just written**: `scripts/check_dormant_obligations.py` runs
+in `make check` and fails when any of their activation triggers appears in the
+source without the corresponding control. Each has been observed both firing
+and clearing.
+
+None may be closed because the control exists. Each names the
+failure-injection test that must be observed failing first — an obligation
+closed on the strength of code being present is the same mistake in a new
+place.
 
 ## REV-001 — "Cancel queued invocations" is vacuous until execution is async
 
