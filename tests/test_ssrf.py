@@ -76,10 +76,28 @@ def test_plaintext_http_is_rejected_by_default():
     assert exc.value.reason == "scheme_not_allowed"
 
 
-@pytest.mark.parametrize("url", ["file:///etc/passwd", "gopher://x/", "ftp://x/"])
+@pytest.mark.parametrize(
+    "url",
+    [
+        "file://api.example.com/etc/passwd",
+        "gopher://api.example.com/",
+        "ftp://api.example.com/",
+        "unix://api.example.com/var/run/docker.sock",
+        "jar://api.example.com/x",
+    ],
+)
 def test_non_http_schemes_are_rejected(url):
-    with pytest.raises(SSRFBlocked):
+    """The REASON matters, not merely that something was raised.
+
+    An earlier version used hosts outside the allowlist, so it passed even
+    with scheme validation removed entirely — the host check caught those
+    URLs for an unrelated reason. Mutation testing surfaced that: deleting
+    the scheme check left the suite green. The host here is allowlisted, so
+    only the scheme can be what rejects it.
+    """
+    with pytest.raises(SSRFBlocked) as exc:
         validate_url(url, ALLOWED)
+    assert exc.value.reason == "scheme_not_allowed"
 
 
 def test_host_must_be_allowlisted():

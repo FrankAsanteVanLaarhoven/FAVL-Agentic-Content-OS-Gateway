@@ -229,23 +229,63 @@ Enforced by review. See CONTRIBUTING.
 
 ---
 
-## I10 — A metric that detects a failure must not be maintained by the thing that fails
+## I10 — A health signal must not be produced by the component it describes
 
-Outbox backlog gauges were refreshed only inside the publisher's own loop.
-When the publisher stopped — the precise incident `OutboxOldestPendingTooOld`
-exists to catch — the gauges froze at their last healthy values and the alert
-could not fire. It reported green throughout a real stall.
+A signal for component X is computed by an independent observer, or derived
+on pull from state X does not control, and never by X alone. A component that
+has stopped cannot report that it has stopped.
 
-Gauges are now refreshed on scrape, in the `/metrics` handler, so a scrape
-reflects the database regardless of publisher health.
+| Component | Wrong | Correct |
+|---|---|---|
+| Outbox | publisher updates the backlog gauge | scrape derives backlog from the database |
+| Connector | connector reports itself healthy | the runtime probes it and records the result |
+| Agent | agent reports itself running | an observer watches a heartbeat it does not write |
+| Workflow | workflow updates its own completion metric | the engine derives completion from persisted state |
+| Gateway | service reports its own latency | APISIX and the collector measure it |
 
+Only the first row is implemented; the rest are the standard this platform
+holds itself to as those components are built, and a violation is a design
+error rather than a bug to be found later.
+
+> Violated once: outbox gauges were refreshed only inside the publisher's own
+> run loop. When the publisher stopped — the precise incident
+> `OutboxOldestPendingTooOld` exists to catch — the gauges froze at their
+> last healthy values and the alert could not fire. It reported green
+> throughout a deliberately injected stall.
+>
 > Found by writing the alert firing test, not by review. Every earlier check
-> on this alert — promtool, the metric-name checker, the expression rewrite
-> from `and` to `unless` — passed while it remained incapable of firing.
+> on that alert — promtool, the metric-name checker, the rewrite from `and`
+> to `unless` — passed while it remained incapable of firing. None of them
+> could observe that the input never moved.
 
 Enforced by `main.py::prometheus_metrics` in both services.
 Tested by `tests/verify_alerts.sh`. **Failure observed** — the test failed
 before this change and passes after.
+
+Residual: a scrape that cannot reach the database serves stale gauges. It
+logs, and `up{}` covers the total-failure case, but a database that is slow
+rather than down is not distinguished.
+
+## I11 — A static check validates a file; only the running system is deployed
+
+promtool parses the rule file. `check_alert_metrics.py` proves it names real
+series. Neither says the running instance is evaluating it.
+
+> OBS-001. `OutboxStalledWhileWriting` never fired through three controlled
+> stalls. The expression was not at fault — the repository held the corrected
+> rule and Prometheus held the previous one, because `/-/reload` was disabled
+> and nothing had restarted it. Every static check was green against a rule
+> that was not deployed.
+>
+> The alert was then removed anyway, on redundancy grounds: every way
+> delivery can stall produces an ageing backlog, which
+> `OutboxOldestPendingTooOld` detects in about ninety seconds. A second page
+> for the same incident, ten minutes later, is noise.
+
+Enforced by `--web.enable-lifecycle` and the drift assertion in
+`tests/verify_alerts.sh`, which compares the deployed rule set to the file.
+**Failure observed** — the drift check was written against the stale state
+and reported it.
 
 ## Consequences
 
@@ -265,4 +305,4 @@ needs a superseding ADR, not a code comment.
 | Secrets resolve from environment variables | Names are derived, never caller-supplied; scoped by owner | M1.7 |
 | No tenant administration; tenant comes from one user attribute | Claim is IdP-issued and unforgeable through the gateway | M3 |
 | Agents may reference a connector id from another tenant at creation | Invocation is refused at fan-out; only the reference is permitted | M1.4 |
-| `OutboxStalledWhileWriting` has never been observed to fire | The backlog-age alert covers the same incident and IS validated end to end; the metric-name checker proves the expression names real series | M1.4 |
+| A config change can sit undeployed | `verify_alerts.sh` compares the running rule set against the file; `--web.enable-lifecycle` makes reload possible | closed |
