@@ -1,0 +1,43 @@
+
+== 0/7  the outbox indexes are real, not constant-false ==
+  PASS  the claim index exists                               yes
+  PASS  its predicate references the status COLUMN           yes
+  PASS  its predicate is not a constant expression           column
+  PASS  the claim query plan uses an outbox index            yes
+  PASS  the claim query plan is not a sequential scan        indexed
+
+== 1/7  crash between commit and publish loses no event ==
+  PASS  committed rows with publisher off                    50
+  PASS  events staged but unpublished                        50
+  PASS  stream unchanged while publisher is off              8239
+
+== 2/7  restarting the publisher delivers every pending event ==
+  PASS  all staged events published after restart            50
+  PASS  no pending backlog remains                           0
+
+== 3/7  republication produces no duplicate downstream effect ==
+  PASS  republished rows are inside the duplicate window     yes
+  PASS  stream count unchanged after 10 republished ids      8289
+
+== 4/7  publish failure does not roll back the accepted write ==
+  PASS  write accepted while broker is down                  201
+  PASS  backlog drains once the broker returns               0
+
+== 5/7  poison events become visible instead of retrying forever ==
+  PASS  poison event reaches dead state                      dead
+  PASS  dead event stops consuming retries                   3
+  PASS  dead count exposed in readiness                      1
+
+== 6/7  hard crashes during load lose and duplicate nothing ==
+  [killer] SIGKILL #1
+  [killer] SIGKILL #2
+  [killer] SIGKILL #3
+  [killer] SIGKILL #4
+  PASS  the orchestrator was hard-killed four times          4
+  PASS  the load phase committed a meaningful number of writes yes
+  PASS  every committed write produced an event              75
+  PASS  every event was delivered                            75
+  PASS  no agent produced two events                         0
+
+---------------------------------------------
+passed: 22   failed: 0

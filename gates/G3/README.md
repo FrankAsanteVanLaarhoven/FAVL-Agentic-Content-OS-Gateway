@@ -8,6 +8,7 @@ Evidence for the milestone gate: **revocation prevents new use immediately.**
 | `mutations.txt` | 25/25 mutations killed, 8 of them on the lifecycle |
 | `revocation_failure_validated.txt` | The gate observed FAILING with the defect reintroduced |
 | `migration_rollback.txt` | 0008 down to 0007 and back to head |
+| `verify_outbox_regression.txt` | M1.2's delivery guarantee still holds under M1.4 |
 
 ## What the gate actually tested
 
@@ -34,6 +35,16 @@ the gate re-run. It failed as it should:
 
 The defect was reverted and the suite returned to 41/41. A gate never watched
 failing is a gate that has not been tested.
+
+## Regression check on M1.2
+
+Every lifecycle transition now stages an outbox event and an audit row in the
+same transaction as the state change, so M1.4 writes into the machinery M1.2
+gated. `verify_outbox_regression.txt` is a full re-run of `verify_outbox.sh`
+with all M1.4 code deployed — 22/22 across all seven sections, including four
+SIGKILLs during a 300-write load. A milestone that quietly weakened the
+delivery guarantee while passing its own tests is the failure mode this
+rules out.
 
 ## Defects this gate found that the unit tests did not
 
