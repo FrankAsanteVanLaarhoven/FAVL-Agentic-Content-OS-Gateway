@@ -343,6 +343,14 @@ bash tests/verify_outbox.sh
 It takes several minutes and asserts 15 conditions. It writes test rows into
 the development database, so do not point it at anything you care about.
 
+## Where this is
+
+M1.4 (connector lifecycle) is complete and gated. The next milestone,
+**M1.5 — Credential and Installation Lifecycle**, is briefed in
+`docs/M1.5-PLAN.md` with its core invariant, the design decisions already
+settled, and the seven gates it must pass. Start there rather than from this
+README.
+
 ## Connector lifecycle
 
 A connector is a state machine, not a row with an `enabled` flag. The states
