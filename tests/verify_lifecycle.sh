@@ -9,6 +9,11 @@
 # The milestone gate is section 3: a connector is revoked while an invocation
 # is in flight, and the next invocation must be refused. No cache flush, no
 # consumer convergence, no worker restart.
+#
+# Section 3 also asserts the other half of the policy — that the in-flight
+# invocation COMPLETES. Both directions matter: a revocation that stopped
+# running work would be just as much a departure from ADR 0002 as one that
+# kept serving new requests.
 set -uo pipefail
 
 cd "$(dirname "$0")/.."
@@ -199,10 +204,12 @@ async def main() -> None:
         print(f"invoke_after_revoke_code={(body.get('detail') or body).get('error_code')}")
         print(f"refusal_latency_ms={elapsed_ms}")
 
-        # What happened to the in-flight one is reported, not asserted as a
-        # requirement: revocation prevents NEW use. Killing work already
-        # accepted is a separate decision, and pretending otherwise here
-        # would hide which property was actually tested.
+        # Standard revocation lets running work finish under the authority
+        # snapshot pinned at acceptance (ADR 0002). Terminating it would risk
+        # partial external side effects and audit records that cannot answer
+        # "did this run?" — and would report success while remote execution
+        # continued. Emergency revocation, which does request cancellation,
+        # is not implemented.
         try:
             done = await asyncio.wait_for(inflight, timeout=40)
             print(f"inflight_status={done.status_code}")
@@ -289,7 +296,12 @@ check "revoked cannot be re-enabled"     "$(expect_key "$OUT" enable_after_revok
 check "revoked cannot be reconfigured"   "$(expect_key "$OUT" configure_after_revoke)"     "409"
 check "repeating a revoke is a success"  "$(expect_key "$OUT" revoke_repeated)"            "200"
 printf '  INFO  %-58s %s ms\n' "refusal observed after revoke" "$(expect_key "$OUT" refusal_latency_ms)"
-printf '  INFO  %-58s %s\n' "in-flight invocation outcome (reported, not required)" "$(expect_key "$OUT" inflight_status)"
+# Asserted, not reported, since ADR 0002. Standard revocation lets running
+# work finish under the authority snapshot pinned at acceptance. If someone
+# later makes revocation terminate in-flight invocations, this is the line
+# that will tell them the ADR needs amending first.
+check "in-flight invocation completes (ADR 0002)" \
+  "$(expect_key "$OUT" inflight_status)" "200"
 
 echo
 echo "-- 4. archival --"

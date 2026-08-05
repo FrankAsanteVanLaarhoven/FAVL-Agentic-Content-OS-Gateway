@@ -31,8 +31,8 @@
   PASS  revoked cannot be re-enabled                               409
   PASS  revoked cannot be reconfigured                             409
   PASS  repeating a revoke is a success                            200
-  INFO  refusal observed after revoke                              22 ms
-  INFO  in-flight invocation outcome (reported, not required)      200
+  INFO  refusal observed after revoke                              10 ms
+  PASS  in-flight invocation completes (ADR 0002)                  200
 
 -- 4. archival --
   PASS  archive succeeds                                           200
@@ -57,4 +57,4 @@
   PASS  DELETE is refused                                          yes
   PASS  connector row protected by audit FK                        yes
 
-== 41 passed, 0 failed ==
+== 42 passed, 0 failed ==

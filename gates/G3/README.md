@@ -4,7 +4,7 @@ Evidence for the milestone gate: **revocation prevents new use immediately.**
 
 | File | What it proves |
 |---|---|
-| `verify_lifecycle.sh.txt` | 41 assertions against the live stack, through APISIX, with a real token |
+| `verify_lifecycle.sh.txt` | 42 assertions against the live stack, through APISIX, with a real token |
 | `mutations.txt` | 25/25 mutations killed, 8 of them on the lifecycle |
 | `revocation_failure_validated.txt` | The gate observed FAILING with the defect reintroduced |
 | `migration_rollback.txt` | 0008 down to 0007 and back to head |
@@ -18,12 +18,19 @@ a second invocation. The second is refused with 403 `CONNECTOR_REVOKED`,
 observed 15 ms after the revoke response. No cache flush, no worker restart,
 no consumer convergence.
 
-## What it deliberately did not test
+## The other half of the policy
 
-The in-flight invocation **completes** (200). Revocation prevents new use;
-it does not cancel work already accepted. The script reports that outcome
-rather than asserting it, because asserting either way would imply a decision
-that has not been made. Recorded as residual risk in ADR 0001.
+The in-flight invocation **completes** (200), and since ADR 0002 that is
+asserted rather than reported. Standard revocation blocks new use and lets
+running work finish under the authority snapshot pinned at acceptance.
+
+Both directions are gated deliberately. A revocation that terminated running
+work would be as much a departure from the policy as one that kept serving new
+requests — and the more tempting mistake, because it looks stricter.
+
+The platform does not claim to cancel provider-side work already accepted
+remotely. Emergency revocation, which requests cancellation, is designed in
+ADR 0002 and NOT implemented.
 
 ## Failure validation
 
