@@ -24,8 +24,9 @@ from ..security.policy import (
 )
 from ..security.secrets import (
     SecretNotFound,
+    SecretNotPermitted,
     SecretResolver,
-    is_addressable,
+    check_addressable,
     is_secret_reference,
 )
 from ..security.ssrf import OutboundPolicy, SSRFBlocked
@@ -80,13 +81,15 @@ class HttpAdapter:
 
         for key, value in (config.get("headers") or {}).items():
             if is_secret_reference(value):
-                if not is_addressable(value):
-                    errors.append(
-                        f"header '{key}' references {value}, which a connector "
-                        f"may not address. Secret names must begin with the "
-                        f"connector secret prefix; the process environment "
-                        f"also holds database and service credentials."
+                try:
+                    check_addressable(
+                        value, owner=str(config.get("name", "")), tenant=""
                     )
+                except SecretNotPermitted as exc:
+                    if "may not read" not in str(exc):
+                        # Ownership cannot be judged at config time (the
+                        # record has no id yet); only the form is checked.
+                        errors.append(f"header '{key}': {exc.why}")
                 continue
             if key.lower() in ("authorization", "x-api-key"):
                 errors.append(
@@ -120,8 +123,13 @@ class HttpAdapter:
     ) -> dict[str, str]:
         headers = {"Content-Type": "application/json", "Accept": "application/json"}
         for key, value in (context.config.get("headers") or {}).items():
+            # Ownership comes from the connector record, never from the
+            # reference, so naming another connector's secret resolves to a
+            # permission error rather than that connector's value.
             headers[key] = (
-                await self._secrets.resolve(value)
+                await self._secrets.resolve(
+                    value, owner=context.connector_id, tenant=context.tenant_id
+                )
                 if is_secret_reference(value)
                 else value
             )

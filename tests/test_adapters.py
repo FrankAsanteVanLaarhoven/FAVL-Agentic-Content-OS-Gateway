@@ -325,13 +325,25 @@ def test_secret_references_are_recognised():
     assert not is_secret_reference("literal")
 
 
-def test_env_resolver_reads_only_addressable_references(monkeypatch):
-    monkeypatch.setenv("CONNECTOR_SECRET_MY_KEY", "value")
-    assert run(EnvSecretResolver().resolve("env:CONNECTOR_SECRET_MY_KEY")) == "value"
+def test_resolver_derives_the_storage_name_from_the_reference(monkeypatch):
+    """The connector names a logical secret; the platform names the storage."""
+    from app.security.secrets import SecretRef
+
+    ref = SecretRef("connector", "c-1", "signing")
+    monkeypatch.setenv(ref.env_name(), "value")
+    assert (
+        run(EnvSecretResolver().resolve(ref.as_text(), owner="c-1", tenant="t"))
+        == "value"
+    )
+
+
+def test_absent_secret_raises_not_found(monkeypatch):
     with pytest.raises(SecretNotFound):
-        run(EnvSecretResolver().resolve("vault:nope"))
-    with pytest.raises(SecretNotFound):
-        run(EnvSecretResolver().resolve("env:CONNECTOR_SECRET_ABSENT"))
+        run(
+            EnvSecretResolver().resolve(
+                "secret://connector/c-1/missing", owner="c-1", tenant="t"
+            )
+        )
 
 
 @pytest.mark.parametrize(
@@ -339,27 +351,50 @@ def test_env_resolver_reads_only_addressable_references(monkeypatch):
     [
         "env:INTERNAL_SERVICE_TOKEN",
         "env:POSTGRES_PASSWORD",
-        "env:KEYCLOAK_CLIENT_SECRET",
-        "env:PATH",
+        "vault:secret/data/prod",
+        "secret://connector/../../etc/passwd",
+        "secret://operator/global/key",
+        "secret://connector/c-1/key/extra",
+        "not-a-reference",
     ],
 )
-def test_connector_cannot_address_operator_secrets(reference, monkeypatch):
-    """A connector must not be able to name an arbitrary environment value.
+def test_no_reference_can_address_arbitrary_storage(reference, monkeypatch):
+    """A connector must not be able to express a storage location at all.
 
     The process environment holds the database password and the token that
-    authenticates /internal. An unconstrained `env:` reference in a header
-    would send it to a caller-chosen host on the first invocation, which
-    escalates straight back into the internal surface.
+    authenticates /internal. A resolver with a generic lookup meant a header
+    value could deliver either to a caller-chosen host on first invocation.
     """
-    from app.security.secrets import SecretNotPermitted, is_addressable
+    from app.security.secrets import SecretNotPermitted
 
-    monkeypatch.setenv(reference.removeprefix("env:"), "operator-secret")
-    assert not is_addressable(reference)
+    monkeypatch.setenv("INTERNAL_SERVICE_TOKEN", "operator-secret")
     with pytest.raises(SecretNotPermitted):
-        run(EnvSecretResolver().resolve(reference))
+        run(EnvSecretResolver().resolve(reference, owner="c-1", tenant="t"))
 
 
-def test_http_adapter_rejects_a_non_addressable_secret_reference():
+def test_a_connector_cannot_read_another_connectors_secret():
+    from app.security.secrets import SecretNotPermitted, check_addressable
+
+    with pytest.raises(SecretNotPermitted, match="may not read"):
+        check_addressable("secret://connector/victim/key", owner="attacker", tenant="t")
+
+
+def test_a_connector_cannot_read_another_tenants_secret():
+    from app.security.secrets import SecretNotPermitted, check_addressable
+
+    with pytest.raises(SecretNotPermitted, match="may not read"):
+        check_addressable("secret://tenant/victim/key", owner="c-1", tenant="mine")
+
+
+def test_legacy_env_references_are_refused_not_translated():
+    """A silent translation would let an unmigrated record keep working."""
+    from app.security.secrets import SecretNotPermitted, parse_reference
+
+    with pytest.raises(SecretNotPermitted, match="no longer accepted"):
+        parse_reference("env:ANYTHING")
+
+
+def test_http_adapter_rejects_a_legacy_storage_reference():
     adapter = build_registry().get("http")
     report = run(
         adapter.validate_config(
@@ -371,7 +406,7 @@ def test_http_adapter_rejects_a_non_addressable_secret_reference():
         )
     )
     assert not report.valid
-    assert any("may not address" in e for e in report.errors)
+    assert any("no longer accepted" in e for e in report.errors)
 
 
 @pytest.mark.parametrize(

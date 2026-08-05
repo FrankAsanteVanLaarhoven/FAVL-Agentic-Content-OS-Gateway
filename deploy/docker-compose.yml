@@ -65,8 +65,9 @@ services:
       OUTBOUND_ALLOWED_SCHEMES: ${OUTBOUND_ALLOWED_SCHEMES:-https}
       OUTBOUND_ALLOW_PRIVATE_ADDRESSES: ${OUTBOUND_ALLOW_PRIVATE_ADDRESSES:-false}
       OUTBOUND_MAX_RESPONSE_BYTES: ${OUTBOUND_MAX_RESPONSE_BYTES:-1048576}
-      CONNECTOR_SECRET_PREFIX: ${CONNECTOR_SECRET_PREFIX:-CONNECTOR_SECRET_}
-      CONNECTOR_SECRET_WEBHOOK_SIGNING_KEY: ${WEBHOOK_SIGNING_KEY:-dev-signing-key}
+      # Storage names are DERIVED from secret:// references, never named
+      # by a connector. See security/secrets.py::SecretRef.env_name.
+      FAVL_SECRET_CONNECTOR_DEMO_SIGNING: ${WEBHOOK_SIGNING_KEY:-dev-signing-key}
     depends_on:
       nats:
         condition: service_started

@@ -31,7 +31,8 @@ SENSITIVE_HEADER = re.compile(
     re.IGNORECASE,
 )
 
-REFERENCE_PREFIXES = ("env:", "vault:", "gsm:", "asm:")
+# A reference is safe to publish; a value never is.
+REFERENCE_PREFIXES = ("secret://",)
 
 
 def _is_reference(value: Any) -> bool:

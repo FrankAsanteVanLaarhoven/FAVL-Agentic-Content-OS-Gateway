@@ -58,7 +58,57 @@ await_ready() {
 }
 
 # --------------------------------------------------------------------------
-banner "1/6  crash between commit and publish loses no event"
+banner "0/7  the outbox indexes are real, not constant-false"
+# --------------------------------------------------------------------------
+# The ORM once declared the hot-path index with `func.lower("status")`, which
+# SQLAlchemy coerced to a bound literal: the predicate compiled to
+# `lower('status') = 'pending'`, a constant false. Postgres accepted the
+# index and kept it permanently empty, so the publisher's claim query fell
+# back to a sequential scan on every 250ms poll.
+#
+# The plan itself is data-dependent — with no pending rows the planner
+# reasonably picks a different index — so asserting the plan would be flaky.
+# The predicate text is not: a constant-false index is wrong regardless of
+# what is in the table.
+PREDICATE=$($DC exec -T postgres psql -U favl -d favl_orchestrator -tAc \
+  "SELECT indexdef FROM pg_indexes WHERE indexname = 'ix_outbox_events_claim'" \
+  2>/dev/null | tr -d '\r')
+
+check "the claim index exists" \
+  "$([ -n "$PREDICATE" ] && echo yes || echo no)" "yes"
+# Postgres renders the column with its cast: ((status)::text = 'pending'::text).
+# The distinguishing feature of the broken form is that `status` appeared as a
+# quoted literal inside lower(), never as a bare column reference.
+check "its predicate references the status COLUMN" \
+  "$(echo "$PREDICATE" | grep -qE "\(status\)?(::text)? *= *'pending'" && echo yes || echo no)" "yes"
+check "its predicate is not a constant expression" \
+  "$(echo "$PREDICATE" | grep -qi "lower(" && echo constant || echo column)" "column"
+
+# With a realistic pending backlog the planner has a genuine choice, so the
+# plan becomes deterministic and worth asserting. Everything happens inside a
+# rolled-back transaction, so the probe rows never reach the publisher.
+# A constant-false index cannot appear in this plan at any data volume.
+PLAN=$($DC exec -T postgres psql -U favl -d favl_orchestrator -tAc \
+  "BEGIN;
+   INSERT INTO outbox_events (id, aggregate_type, aggregate_id, aggregate_version,
+     subject, schema_version, payload, status, attempts, max_attempts,
+     next_attempt_at, created_at)
+   SELECT gen_random_uuid(), 'probe', 'idx', 1, 'probe.index', 1, '{}'::jsonb,
+     'pending', 0, 8, now() - interval '1 hour', now() - interval '1 hour'
+   FROM generate_series(1, 2000);
+   ANALYZE outbox_events;
+   EXPLAIN SELECT * FROM outbox_events
+     WHERE status = 'pending' AND next_attempt_at <= now()
+     ORDER BY created_at LIMIT 100 FOR UPDATE SKIP LOCKED;
+   ROLLBACK;" 2>/dev/null | tr -d '\r')
+
+check "the claim query plan uses an outbox index" \
+  "$(echo "$PLAN" | grep -qiE 'Index Scan using ix_outbox_events' && echo yes || echo no)" "yes"
+check "the claim query plan is not a sequential scan" \
+  "$(echo "$PLAN" | grep -qi 'Seq Scan on outbox_events' && echo seq || echo indexed)" "indexed"
+
+# --------------------------------------------------------------------------
+banner "1/7  crash between commit and publish loses no event"
 # --------------------------------------------------------------------------
 OUTBOX_PUBLISHER_ENABLED=false $DC up -d --no-deps orchestrator >/dev/null 2>&1
 sleep 10
@@ -105,7 +155,7 @@ check "events staged but unpublished" \
 check "stream unchanged while publisher is off" "$(js_count)" "$JS_BEFORE"
 
 # --------------------------------------------------------------------------
-banner "2/6  restarting the publisher delivers every pending event"
+banner "2/7  restarting the publisher delivers every pending event"
 # --------------------------------------------------------------------------
 $DC up -d --no-deps orchestrator >/dev/null 2>&1
 drain 20
@@ -115,7 +165,7 @@ check "no pending backlog remains" \
   "$(psql_orch "SELECT count(*) FROM outbox_events WHERE status='pending'")" "0"
 
 # --------------------------------------------------------------------------
-banner "3/6  republication produces no duplicate downstream effect"
+banner "3/7  republication produces no duplicate downstream effect"
 # --------------------------------------------------------------------------
 # Deduplication is bounded by the stream's duplicate window (2h), so this
 # check is only meaningful on rows published inside it. An earlier version
@@ -139,7 +189,7 @@ drain 20
 check "stream count unchanged after 10 republished ids" "$(js_count)" "$JS_BEFORE"
 
 # --------------------------------------------------------------------------
-banner "4/6  publish failure does not roll back the accepted write"
+banner "4/7  publish failure does not roll back the accepted write"
 # --------------------------------------------------------------------------
 await_ready 90
 $DC stop nats >/dev/null 2>&1
@@ -183,7 +233,7 @@ check "backlog drains once the broker returns" \
   "$(psql_orch "SELECT count(*) FROM outbox_events WHERE status='pending'")" "0"
 
 # --------------------------------------------------------------------------
-banner "5/6  poison events become visible instead of retrying forever"
+banner "5/7  poison events become visible instead of retrying forever"
 # --------------------------------------------------------------------------
 psql_orch "DELETE FROM outbox_events WHERE aggregate_id='poison'" >/dev/null
 # A subject containing spaces is invalid at the protocol level and can never
@@ -207,7 +257,7 @@ check "dead count exposed in readiness" \
 psql_orch "DELETE FROM outbox_events WHERE aggregate_id='poison'" >/dev/null
 
 # --------------------------------------------------------------------------
-banner "6/6  hard crashes during load lose and duplicate nothing"
+banner "6/7  hard crashes during load lose and duplicate nothing"
 # --------------------------------------------------------------------------
 await_ready 90
 RUN="kc$(date +%s)"

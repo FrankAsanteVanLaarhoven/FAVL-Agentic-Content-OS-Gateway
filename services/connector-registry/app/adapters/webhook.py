@@ -31,8 +31,9 @@ from ..security.policy import (
 )
 from ..security.secrets import (
     SecretNotFound,
+    SecretNotPermitted,
     SecretResolver,
-    is_addressable,
+    check_addressable,
     is_secret_reference,
 )
 from ..security.ssrf import OutboundPolicy, SSRFBlocked
@@ -100,12 +101,12 @@ class WebhookAdapter:
                 "config.signing_secret_ref must be a reference such as "
                 "env:NAME, never a literal secret"
             )
-        elif not is_addressable(secret_ref):
-            errors.append(
-                f"config.signing_secret_ref references {secret_ref}, which a "
-                "connector may not address; secret names must begin with the "
-                "connector secret prefix"
-            )
+        else:
+            try:
+                check_addressable(secret_ref, owner="", tenant="")
+            except SecretNotPermitted as exc:
+                if "may not read" not in str(exc):
+                    errors.append(f"config.signing_secret_ref: {exc.why}")
 
         if config.get("signing_secret"):
             errors.append("config.signing_secret is not permitted; use a reference")
@@ -138,7 +139,11 @@ class WebhookAdapter:
             return HealthResult(False, f"target rejected: {exc.reason}", started)
 
         try:
-            await self._secrets.resolve(context.config["signing_secret_ref"])
+            await self._secrets.resolve(
+                context.config["signing_secret_ref"],
+                owner=context.connector_id,
+                tenant=context.tenant_id,
+            )
         except SecretNotFound as exc:
             return HealthResult(False, f"secret unresolved: {exc.reference}", started)
 
@@ -160,7 +165,11 @@ class WebhookAdapter:
             )
 
         try:
-            secret = await self._secrets.resolve(context.config["signing_secret_ref"])
+            secret = await self._secrets.resolve(
+                context.config["signing_secret_ref"],
+                owner=context.connector_id,
+                tenant=context.tenant_id,
+            )
         except (SecretNotFound, KeyError) as exc:
             return InvocationResult.failure(
                 ErrorCode.SECRET_NOT_FOUND,
