@@ -188,11 +188,23 @@ accepted under credential v7 → credential v7 revoked before the retry
                              → the retry must not resolve or use v7
 ```
 
-`reauthorise_attempt()` must re-evaluate connector status, tenant ownership,
-credential version, revocation timestamp, authority snapshot and deadline —
-all six. Re-checking only the connector would leave a revoked *credential*
-usable, which is I13a, and is the more likely omission because the connector
-check already exists to be copied.
+`reauthorise_attempt()` must re-evaluate all six, and they are decomposed
+this way deliberately:
+
+```
+connector status
+connector tenant ownership
+credential status
+credential tenant ownership
+credential version binding
+invocation deadline / authority context
+```
+
+Connector and credential tenancy are separate lines because checking one and
+assuming the other follows is the likely omission — the connector check
+already exists to be copied, and copying it feels like completing the job.
+Re-checking only the connector leaves a revoked *credential* usable, which is
+I13a.
 
 **Done when:** any retry implementation re-authorises before resolving
 secrets, and a mutation removing that check kills a named test. The M1.5

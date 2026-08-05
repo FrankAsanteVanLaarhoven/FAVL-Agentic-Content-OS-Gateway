@@ -142,11 +142,15 @@ OBLIGATIONS: tuple[Obligation, ...] = (
         },
         control=r"reauthorise_attempt|def\s+reauthorise",
         control_description=(
-            "a reauthorise_attempt() that re-evaluates ALL of: connector "
-            "status, tenant ownership, credential version, revocation "
-            "timestamp, authority snapshot, deadline. A retry must not "
-            "inherit credentials or authority merely because the first "
-            "attempt was accepted"
+            "a reauthorise_attempt() re-evaluating ALL SIX of: connector "
+            "status, connector tenant ownership, credential status, "
+            "credential tenant ownership, credential version binding, "
+            "invocation deadline/authority context. Connector and credential "
+            "tenancy are listed separately on purpose — checking one and "
+            "assuming the other is the likely omission, because the connector "
+            "check already exists to be copied. A retry must not inherit "
+            "credentials or authority merely because the first attempt was "
+            "accepted"
         ),
         closes_when=(
             "the retry path re-authorises before resolving secrets, and a "
